@@ -1,0 +1,125 @@
+{
+  "retrievedAt": "2026-10-09T13:27:42.352Z",
+  "entries": [
+    {
+      "id": "f309dd465ee3112e4d156bc3",
+      "kind": "highschool",
+      "school": "膳所高等学校",
+      "faculty": "",
+      "department": "理数科",
+      "deviation": 76,
+      "year": 2026,
+      "source_url": "https://www.minkou.jp/hischool/ranking/deviation/"
+    },
+    {
+      "id": "e13222080a14fbf67e00b1b2",
+      "kind": "highschool",
+      "school": "神戸高等学校",
+      "faculty": "",
+      "department": "総合理学科",
+      "deviation": 75,
+      "year": 2026,
+      "source_url": "https://www.minkou.jp/hischool/ranking/deviation/"
+    },
+    {
+      "id": "6224b2294c4d78ff8378b63e",
+      "kind": "highschool",
+      "school": "西大和学園高等学校",
+      "faculty": "",
+      "department": "普通科東大・京大・国公医コース",
+      "deviation": 75,
+      "year": 2026,
+      "source_url": "https://www.minkou.jp/hischool/ranking/deviation/"
+    },
+    {
+      "id": "d0a332817918bf5cf607c8c2",
+      "kind": "university",
+      "school": "慶應義塾大学",
+      "faculty": "医学部",
+      "department": "医学科",
+      "deviation": 72.5,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "86469de1d37d611ef92ee3d1",
+      "kind": "university",
+      "school": "千葉大学",
+      "faculty": "医学部",
+      "department": "医学科",
+      "deviation": 72.5,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "551c0e29bb9f342f71aa2fb1",
+      "kind": "university",
+      "school": "一橋大学",
+      "faculty": "ソーシャル・データサイエンス学部",
+      "department": "ソーシャル・データサイエンス学科",
+      "deviation": 72.5,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "e9c4741988f7ec076e5a94e5",
+      "kind": "university",
+      "school": "一橋大学",
+      "faculty": "経済学部",
+      "department": "経済学科",
+      "deviation": 72.5,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "7ce0fdd2dd3d436b7708e418",
+      "kind": "university",
+      "school": "大阪大学",
+      "faculty": "医学部",
+      "department": "医学科",
+      "deviation": 70,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "5af9331adc355b17dbb174c7",
+      "kind": "university",
+      "school": "京都大学",
+      "faculty": "医学部",
+      "department": "医学科",
+      "deviation": 70,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "2806495c2af79b9aa6a6ac2a",
+      "kind": "university",
+      "school": "慶應義塾大学",
+      "faculty": "環境情報学部",
+      "department": "環境情報学科",
+      "deviation": 70,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "f13b0d2cf87d284d24ed78f1",
+      "kind": "university",
+      "school": "慶應義塾大学",
+      "faculty": "総合政策学部",
+      "department": "総合政策学科",
+      "deviation": 70,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    },
+    {
+      "id": "6bb6da8dd8bbbe55d2b32616",
+      "kind": "university",
+      "school": "国際教養大学",
+      "faculty": "国際教養学部",
+      "department": "国際教養学科",
+      "deviation": 70,
+      "year": 2027,
+      "source_url": "https://www.minkou.jp/university/ranking/deviation/"
+    }
+  ]
+}
