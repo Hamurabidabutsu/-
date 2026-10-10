@@ -613,6 +613,103 @@ button a {
   padding-top: 68px;
   padding-bottom: 53px;
 }
+.service-about {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 26px 55px;
+  padding-top: 68px;
+  padding-bottom: 30px;
+  scroll-margin-top: 100px;
+}
+.service-intro h2 {
+  font-family: var(--serif);
+  font-size: clamp(24px, 2.2vw, 31px);
+  font-weight: 500;
+  line-height: 1.7;
+  margin: 12px 0 22px;
+}
+.service-intro p,
+.service-information p {
+  font-size: 13px;
+  line-height: 2;
+  color: var(--muted);
+}
+.service-intro .text-link {
+  margin-top: 12px;
+}
+.service-information {
+  display: grid;
+  gap: 15px;
+}
+.service-information article {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  background: #fffef9;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 21px;
+}
+.service-information article > svg {
+  flex-shrink: 0;
+  color: #6e8960;
+  margin-top: 3px;
+}
+.service-information h3 {
+  font-size: 14px;
+  font-weight: 500;
+  margin: 0 0 8px;
+}
+.service-information p {
+  margin: 0;
+}
+.service-note {
+  grid-column: 1 / -1;
+  border-left: 2px solid #a4b596;
+  padding-left: 15px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 2;
+  margin: 0;
+}
+.service-faq {
+  padding-top: 55px;
+  padding-bottom: 15px;
+}
+.service-faq details {
+  border-top: 1px solid var(--line);
+}
+.service-faq details:last-child {
+  border-bottom: 1px solid var(--line);
+}
+.service-faq summary {
+  cursor: pointer;
+  padding: 20px 6px;
+  font-size: 14px;
+}
+.service-faq summary:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.service-faq details p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 2;
+  margin: 0;
+  padding: 0 24px 23px;
+  max-width: 900px;
+}
+@media (max-width: 860px) {
+  .service-about {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 26px;
+    padding-top: 40px;
+  }
+  .service-faq {
+    padding-top: 40px;
+  }
+}
 .section-heading {
   display: flex;
   align-items: flex-end;

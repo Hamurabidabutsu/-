@@ -566,7 +566,7 @@ export default function App() {
             >
               提供者を探す
             </Link>
-            <Link href="/#guide">はじめての方へ</Link>
+            <Link href="/#about">はじめての方へ</Link>
             {user && (
               <Link
                 className={pathname === "/chat" ? "nav-active" : ""}
@@ -620,6 +620,7 @@ export default function App() {
             </p>
           </div>
           <div className="footer-links">
+            <Link href="/#about">サービスについて</Link>
             <Link href="/donors">提供者を探す</Link>
             <Link href="/register">提供者登録</Link>
             <Link href="/terms">利用規約</Link>
@@ -918,16 +919,16 @@ function Home({ ctx }: { ctx: Context }) {
             あなたらしい<span className="hero-choice">選択を。</span>
           </h1>
           <p className="hero-description">
-            大切な選択だからこそ、情報を確かめて、対話を重ねる。
+            確認できる情報から、あなたの希望に合う提供者を。
             <br className="desktop-only" />
-            あなたの希望に合う提供者を、あなたのペースで。
+            身体情報・検査結果・提供条件を見比べ、対話を重ねる。
           </p>
           <div className="hero-buttons">
             <Link className="button button-large" href="/donors">
               提供者を探す
               <ArrowRight size={19} />
             </Link>
-            <a className="hero-guide" href="#guide">
+            <a className="hero-guide" href="#about">
               サービスについて
               <ArrowUpRight size={17} />
             </a>
@@ -975,6 +976,62 @@ function Home({ ctx }: { ctx: Context }) {
             <small>会話の承認後にサイト内で相談</small>
           </span>
         </div>
+      </section>
+      <section
+        className="service-about section-shell"
+        id="about"
+        aria-labelledby="about-title"
+      >
+        <div className="service-intro">
+          <span className="eyebrow">ABOUT OUR SERVICE</span>
+          <h2 id="about-title">
+            アピール文だけに頼らず、
+            <br />
+            確認できる情報から。
+          </h2>
+          <p>
+            コウノトリのつばさは、精子提供者の身体情報・検査結果・提供条件を同じ項目で見比べ、自分の希望に合う相手を探せるサービスです。
+          </p>
+          <p>
+            言葉による印象だけで決めるのではなく、確認できるデータを選択の手がかりに。必要な情報を確かめたうえで、サイト内のチャットで直接話し合えます。
+          </p>
+          <a className="text-link" href="#guide">
+            利用の流れを見る
+            <ArrowRight size={17} />
+          </a>
+        </div>
+        <div className="service-information">
+          <article>
+            <FileCheck2 size={21} aria-hidden="true" />
+            <div>
+              <h3>証明資料で確認する情報</h3>
+              <p>
+                提供者の身分証、学歴またはWAISの資料、体組成の測定結果、精液検査の結果を管理者が目視で確認します。感染症検査は任意で、記載する場合は結果の資料を確認します。検査結果には検査日も表示します。
+              </p>
+            </div>
+          </article>
+          <article>
+            <UserRound size={21} aria-hidden="true" />
+            <div>
+              <h3>本人が申告する情報</h3>
+              <p>
+                髪色・髪質、裸眼視力、本人や親族の既往歴、アレルギー、生活習慣、提供可能な地域・曜日などは本人の申告です。気になる点は会話で確認できます。
+              </p>
+            </div>
+          </article>
+          <article>
+            <CircleHelp size={21} aria-hidden="true" />
+            <div>
+              <h3>意味を添えて掲載する参考値</h3>
+              <p>
+                IQ・偏差値は公的なIQ検査結果や学歴から換算した参考値です。上位割合は統計上の仮定から算出します。SMIから求めた骨格筋率には「概算」と表示し、計算方法と精度の限界を説明します。
+              </p>
+            </div>
+          </article>
+        </div>
+        <p className="service-note">
+          掲載情報は提供者本人についての情報です。子どもの性質や、妊娠・出産の結果を保証するものではありません。
+        </p>
       </section>
       <section className="section-shell featured">
         <div className="section-heading">
@@ -1045,6 +1102,44 @@ function Home({ ctx }: { ctx: Context }) {
             ))}
           </div>
         </div>
+      </section>
+      <section
+        className="service-faq section-shell"
+        aria-labelledby="service-faq-title"
+      >
+        <div className="section-heading">
+          <div>
+            <span className="eyebrow">BEFORE YOU BEGIN</span>
+            <h2 id="service-faq-title">ご利用前に知っていただきたいこと</h2>
+          </div>
+        </div>
+        {[
+          {
+            question: "誰が利用できますか？",
+            answer:
+              "日本国内向けの日本語のサービスです。提供者・提供希望者ともに18歳以上の方が対象です。検索と公開プロフィールは、会員登録をせずに閲覧できます。会話を始めるには、メールアドレスとパスワードで登録してください。",
+          },
+          {
+            question: "利用料金はいくらですか？",
+            answer:
+              "提供希望者の登録・利用は無料です。提供者は初回の登録審査と証明書の更新審査に、それぞれ税込5,000円がかかります。同時に複数の証明書を更新する場合は、一括で5,000円です。支払いを確認してから審査を開始します。登録後の定期的な利用料はありません。",
+          },
+          {
+            question: "どの情報が公開されますか？",
+            answer:
+              "年齢、身体情報、IQ等の参考値、検査結果、既往歴などの健康情報、生活習慣、提供条件は一般公開されます。顔写真は任意で、顔写真と学校名は提供者が許可した会話相手だけに開示されます。生年月日・メールアドレス・身分証・証明書原本は一般公開しません。証明書原本は審査終了後に削除します。",
+          },
+          {
+            question: "提供者とはどのように話し合いますか？",
+            answer:
+              "希望者から会話を申請し、提供者が承認するとメッセージや画像を送れます。提供方法・地域・頻度などを確認し、具体的な条件は双方で相談してください。管理者は会話と添付画像を閲覧できます。確認済みメールアドレスへの受信通知は、設定で停止できます。",
+          },
+        ].map(({ question, answer }) => (
+          <details key={question}>
+            <summary>{question}</summary>
+            <p>{answer}</p>
+          </details>
+        ))}
       </section>
       <section className="donor-invitation section-shell">
         <div>

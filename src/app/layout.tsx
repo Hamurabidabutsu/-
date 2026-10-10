@@ -3,7 +3,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "コウノトリのつばさ | 自分らしい選択を、ここから。",
   description:
-    "提供者の情報を確かめて、納得できる選択へ。コウノトリのつばさは、個人間の精子提供について対話するためのサービスです。",
+    "確認できるデータをもとに、希望に合う精子提供者を。身体情報・検査結果・提供条件を見比べ、サイト内のチャットで直接話し合えるサービスです。",
   robots: { index: false, follow: false },
 };
 export default function RootLayout({
