@@ -4,7 +4,12 @@ import {
   useEffect,
   useRef,
   useState,
+  useId,
+  Children,
+  isValidElement,
+  cloneElement,
   type ReactNode,
+  type ReactElement,
 } from "react";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -47,6 +52,7 @@ import {
   Users,
   Trash2,
   Settings2,
+  CircleHelp,
 } from "lucide-react";
 import {
   Academic,
@@ -55,7 +61,17 @@ import {
   User,
   PREFECTURES,
   WEEKDAYS,
-  HAIR,
+  FREQUENCIES,
+  HAIR_TEXTURES,
+  EYELIDS,
+  TOLERANCES,
+  BODY_CATEGORIES,
+  HELP,
+  skeletalRateOf,
+  ageAt,
+  validDate,
+  iqMetrics,
+  semenGrades,
   BLOOD,
   INFECTIONS,
   SEMEN_FIELDS,
@@ -89,6 +105,7 @@ type Context = {
   user: User | null;
   demo: boolean;
   paymentMode: string;
+  mailMode: string;
   notify: (message: string) => void;
   signIn: (role?: "donor" | "recipient") => void;
   refresh: () => Promise<void>;
@@ -149,21 +166,89 @@ function Field({
   children,
   note,
   required,
+  help,
 }: {
+  help?: string;
   label: string;
   children: ReactNode;
   note?: string;
   required?: boolean;
 }) {
+  const labelId = useId();
+  const labelControls = (nodes: ReactNode): ReactNode =>
+    Children.map(nodes, (child) => {
+      if (!isValidElement(child)) return child;
+      const element = child as ReactElement<Record<string, any>>;
+      if (element.type === Select)
+        return cloneElement(element, { labelledBy: labelId });
+      if (typeof element.type !== "string") return element;
+      if (["input", "select", "textarea"].includes(element.type))
+        return element.props["aria-label"]
+          ? element
+          : cloneElement(element, {
+              "aria-labelledby": labelId,
+              "aria-required": required || undefined,
+            });
+      return element.props.children
+        ? cloneElement(element, {
+            children: labelControls(element.props.children),
+          })
+        : element;
+    });
   return (
-    <label className="field">
-      <span>
-        {label}
-        {required && <b className="required">必須</b>}
-      </span>
-      {children}
-      {note && <small>{note}</small>}
-    </label>
+    <div className={"field-shell" + (help ? " has-help" : "")}>
+      <label className="field">
+        <span id={labelId}>
+          {label}
+          {required && (
+            <b className="required" aria-hidden="true">
+              必須
+            </b>
+          )}
+        </span>
+        {labelControls(children)}
+        {note && <small>{note}</small>}
+      </label>
+      {help && <Help title={label} text={help} />}
+    </div>
+  );
+}
+function Help({ title, text }: { title: string; text: string }) {
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+  return (
+    <>
+      <button
+        type="button"
+        className="field-help"
+        aria-label={title + "の説明"}
+        onClick={() => setOpen(true)}
+      >
+        <CircleHelp size={17} />
+      </button>
+      {open && (
+        <Modal title={title} onClose={close}>
+          <p className="help-text">{text}</p>
+        </Modal>
+      )}
+    </>
+  );
+}
+function IQValue({ iq }: { iq: number | null }) {
+  const metrics = iqMetrics(iq);
+  return metrics ? (
+    <span className="iq-values">
+      IQ {iq} ・ 偏差値 {metrics.deviation}
+      <small>
+        上位{" "}
+        {metrics.upperPercent < 0.01
+          ? "0.01％未満"
+          : `${metrics.upperPercent.toFixed(2)}％`}
+        （σ＝18）
+      </small>
+    </span>
+  ) : (
+    <span className="nodata">NoData</span>
   );
 }
 function Select({
@@ -171,14 +256,20 @@ function Select({
   onChange,
   options,
   placeholder,
+  labelledBy,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: string[];
   placeholder?: string;
+  labelledBy?: string;
 }) {
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value)}>
+    <select
+      aria-labelledby={labelledBy}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    >
       {placeholder && <option value="">{placeholder}</option>}
       {options.map((s) => (
         <option key={s} value={s}>
@@ -348,6 +439,7 @@ export default function App() {
     router = useRouter();
   const [user, setUser] = useState<User | null>(null),
     [demo, setDemo] = useState(false),
+    [mailMode, setMailMode] = useState("unconfigured"),
     [paymentMode, setPaymentMode] = useState(""),
     [ready, setReady] = useState(false);
   const [auth, setAuth] = useState<"login" | "signup" | null>(null),
@@ -361,6 +453,7 @@ export default function App() {
       setUser(r.user);
       setDemo(r.demo);
       setPaymentMode(r.paymentMode);
+      setMailMode(r.mailMode);
     } catch (e) {
       notify((e as Error).message);
     } finally {
@@ -382,6 +475,7 @@ export default function App() {
     user,
     demo,
     paymentMode,
+    mailMode,
     notify,
     refresh,
     signIn: (r) => {
@@ -412,6 +506,7 @@ export default function App() {
         donorId={pathname.split("/")[2]}
       />
     );
+  else if (pathname === "/verify-email") content = <VerifyEmail ctx={ctx} />;
   else if (pathname === "/register")
     content = <Registration key={user?.id || "public"} ctx={ctx} />;
   else if (pathname === "/chat")
@@ -647,7 +742,14 @@ function AuthModal({
             </div>
           </Field>
         )}
-        <Field label="メールアドレス">
+        <Field
+          label="メールアドレス"
+          note={
+            mode === "signup"
+              ? "登録後にメールアドレスを確認すると、会話の受信通知が届きます。通知はアカウント画面で停止できます。"
+              : undefined
+          }
+        >
           <input
             type="email"
             autoComplete="email"
@@ -763,6 +865,7 @@ function AccountModal({ ctx, onClose }: { ctx: Context; onClose: () => void }) {
           <p>{ctx.user?.email}</p>
         </div>
       </div>
+      <ContactSettings ctx={ctx} />
       <button className="button button-outline full-width" onClick={logout}>
         <LogOut size={17} />
         ログアウト
@@ -1019,8 +1122,12 @@ function DonorCard({ donor: d }: { donor: Donor }) {
           体脂肪率 <b>{d.bodyFat}%</b>
         </span>
         <span>
-          筋肉量 <b>{d.muscle}kg</b>
+          骨格筋率 <b>{value(skeletalRateOf(d), "%")}</b>
+          {d.skeletalEstimated && <small>（概算）</small>}
         </span>
+      </div>
+      <div className="card-iq">
+        <IQValue iq={d.iq} />
       </div>
       <div className="card-conditions">
         <span>
@@ -1055,6 +1162,9 @@ function SearchPage({ ctx }: { ctx: Context }) {
       maxAge: "",
       minHeight: "",
       minIq: "",
+      bodyFatCategory: "",
+      skeletalCategory: "",
+      semenGrade: "",
       infectionVerified: false,
       sort: "recent",
     }),
@@ -1119,6 +1229,9 @@ function SearchPage({ ctx }: { ctx: Context }) {
                   maxAge: "",
                   minHeight: "",
                   minIq: "",
+                  bodyFatCategory: "",
+                  skeletalCategory: "",
+                  semenGrade: "",
                   infectionVerified: false,
                   sort: "recent",
                 })
@@ -1192,13 +1305,37 @@ function SearchPage({ ctx }: { ctx: Context }) {
               placeholder="すべて"
             />
           </Field>
-          <Field label="IQ（参考値）">
+          <Field label="IQ・偏差値（参考値）" help={HELP.iq}>
             <input
               type="number"
               aria-label="最低IQ"
               placeholder="指定なし"
               value={filters.minIq}
               onChange={(e) => update("minIq", e.target.value)}
+            />
+          </Field>
+          <Field label="体脂肪率" help={HELP.bodyFat}>
+            <Select
+              value={filters.bodyFatCategory}
+              onChange={(v) => update("bodyFatCategory", v)}
+              options={BODY_CATEGORIES}
+              placeholder="指定なし"
+            />
+          </Field>
+          <Field label="骨格筋率" help={HELP.skeletal}>
+            <Select
+              value={filters.skeletalCategory}
+              onChange={(v) => update("skeletalCategory", v)}
+              options={BODY_CATEGORIES}
+              placeholder="指定なし"
+            />
+          </Field>
+          <Field label="精液検査の条件" help={HELP.semen}>
+            <Select
+              value={filters.semenGrade}
+              onChange={(v) => update("semenGrade", v)}
+              options={["良", "秀"]}
+              placeholder="指定なし"
             />
           </Field>
           <label className="check-row">
@@ -1236,6 +1373,7 @@ function SearchPage({ ctx }: { ctx: Context }) {
                 <option value="recent">最近利用のある方</option>
                 <option value="height">身長が高い順</option>
                 <option value="age">年齢が低い順</option>
+                <option value="iq">IQが高い順</option>
               </select>
             </label>
           </div>
@@ -1384,18 +1522,41 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
                 ["身長", d.height, "cm"],
                 ["体重", d.weight, "kg"],
                 ["体脂肪率", d.bodyFat, "%"],
-                ["推定筋肉量", d.muscle, "kg"],
+                [
+                  d.skeletalEstimated ? "骨格筋率（概算）" : "骨格筋率",
+                  skeletalRateOf(d),
+                  "%",
+                ],
               ].map(([label, n, unit]) => (
                 <div key={String(label)}>
                   <small>{label}</small>
-                  <strong>{value(Number(n), String(unit))}</strong>
+                  <strong>
+                    {value(n === null ? null : Number(n), String(unit))}
+                  </strong>
                 </div>
               ))}
             </div>
+            <p className="tiny muted">
+              骨格筋率は機器の測定値・全身骨格筋量との比、またはSMIと身長・測定時年齢からの概算です。概算ではDXA研究の成人男性用式に四肢量を代入しています。当サイトの換算精度は日本人・家庭用機器では未検証で、機器や式により差があります。
+            </p>
             <dl className="definition-list">
               <div>
                 <dt>髪色</dt>
                 <dd>{d.hair}</dd>
+              </div>
+              <div>
+                <dt>髪質</dt>
+                <dd>{d.hairTexture}</dd>
+              </div>
+              <div>
+                <dt>まぶた</dt>
+                <dd>{d.eyelid}</dd>
+              </div>
+              <div>
+                <dt>裸眼視力（左／右）</dt>
+                <dd>
+                  {value(d.visionLeft)} ／ {value(d.visionRight)}
+                </dd>
               </div>
               <div>
                 <dt>血液型</dt>
@@ -1405,12 +1566,14 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
                 </dd>
               </div>
               <div>
-                <dt>IQ（参考値）</dt>
-                <dd>{value(d.iq)}</dd>
+                <dt>IQ・偏差値（参考値）</dt>
+                <dd>
+                  <IQValue iq={d.iq} />
+                </dd>
               </div>
             </dl>
             <p className="tiny muted">
-              IQは、公的なIQ検査結果や学歴から換算した参考値です。
+              IQ・偏差値は、公的なIQ検査結果や学歴から換算した参考値です。上位割合は平均100・標準偏差18の仮定による参考値で、子どもの能力を示すものではありません。
             </p>
           </section>
           <section className="panel">
@@ -1492,6 +1655,13 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
               </h2>
               <ExamDate date={d.semenDate} />
             </div>
+            <p className="semen-flags">
+              {semenGrades(d.semen).good && <span className="badge">良</span>}{" "}
+              {semenGrades(d.semen).excellent && (
+                <span className="badge">秀</span>
+              )}
+              <span className="tiny muted">検索条件への適合表示</span>
+            </p>
             <div className="lab-grid">
               {SEMEN_FIELDS.map((f) => (
                 <div key={f.key}>
@@ -1537,22 +1707,26 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
                 <Heart size={18} />
                 健康・生活習慣
               </h2>
-              <ExamDate date={d.healthDate} />
             </div>
             <dl className="definition-list">
               {[
-                [
-                  "血圧",
-                  d.systolic !== null && d.diastolic !== null
-                    ? `${d.systolic} / ${d.diastolic} mmHg`
-                    : "NoData",
-                ],
                 ["喫煙", d.smoking],
                 ["飲酒", d.drinking],
                 ["運動", d.exercise],
-                ["既往歴", d.history],
-                ["遺伝性疾患", d.hereditary],
-                ["アレルギー", d.allergy],
+                ["本人の既往歴", d.history || "未記載"],
+                ["親族の既往歴", d.familyHistory || "未記載"],
+                [
+                  "喫煙量（喫煙日あたり）",
+                  d.smokingAmount === null ? "NoData" : `${d.smokingAmount}本`,
+                ],
+                [
+                  "飲酒量（1回あたり）",
+                  d.drinkingAmount === null
+                    ? "NoData"
+                    : `純アルコール${d.drinkingAmount}g`,
+                ],
+                ["アルコール耐性", d.alcoholTolerance],
+                ["アレルギー", d.allergy || "未記載"],
               ].map(([k, v]) => (
                 <div key={k}>
                   <dt>{k}</dt>
@@ -1561,7 +1735,7 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
               ))}
             </dl>
             <p className="tiny muted">
-              既往歴・生活習慣等は本人の申告です。「あり」の詳細は会話で確認してください。
+              既往歴・アレルギー・生活習慣等は本人の申告です。親族の既往歴は遺伝性疾患であるかの判定を意味しません。
             </p>
           </section>
           <section className="panel private-panel">
@@ -1842,6 +2016,270 @@ function AcademicEditor({
     </div>
   );
 }
+function SkeletalInput({
+  p,
+  birthDate,
+  onChange,
+}: {
+  p: ProfileData;
+  birthDate: string;
+  onChange: (p: Partial<ProfileData>) => void;
+}) {
+  const [mode, setMode] = useState<"skeletalRate" | "skeletalMass" | "smi">(
+    p.skeletalMass !== null
+      ? "skeletalMass"
+      : p.smi !== null
+        ? "smi"
+        : "skeletalRate",
+  );
+  useEffect(() => {
+    if (p.skeletalMass !== null) setMode("skeletalMass");
+    else if (p.smi !== null) setMode("smi");
+    else if (p.skeletalRate !== null) setMode("skeletalRate");
+  }, [p.skeletalMass, p.smi, p.skeletalRate]);
+  const labels = {
+    skeletalRate: "骨格筋率",
+    skeletalMass: "全身の骨格筋量",
+    smi: "SMI（概算用）",
+  };
+  const preview = {
+    ...p,
+    bodyAge:
+      validDate(p.bodyDate) && birthDate ? ageAt(birthDate, p.bodyDate) : null,
+  };
+  return (
+    <div>
+      <Field label="体組成の入力形式" help={HELP.skeletal}>
+        <select
+          value={mode}
+          onChange={(e) => {
+            setMode(e.target.value as typeof mode);
+            onChange({
+              skeletalMass: null,
+              skeletalRate: null,
+              smi: null,
+              bodyAge: null,
+            });
+          }}
+        >
+          {Object.entries(labels).map(([k, label]) => (
+            <option key={k} value={k}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <Field
+        label={labels[mode]}
+        required
+        note={
+          mode === "smi"
+            ? "四肢筋肉量÷身長(m)²として報告されたSMI専用。測定時18歳以上・BMI35未満の成人男性用式による概算。日本人・家庭用機器での換算精度は未検証です。"
+            : "測定器で全身の骨格筋と明示された値を入力してください。心筋・平滑筋等を含む一般筋肉量は直接登録できません。"
+        }
+      >
+        <div className="input-unit">
+          <input
+            type="number"
+            step={mode === "smi" ? "0.01" : "0.1"}
+            min={mode === "smi" ? "0.1" : "1"}
+            max={mode === "skeletalRate" ? 100 : mode === "smi" ? 30 : p.weight}
+            value={p[mode] ?? ""}
+            onChange={(e) =>
+              onChange({
+                skeletalRate: null,
+                skeletalMass: null,
+                smi: null,
+                bodyAge: null,
+                [mode]: e.target.value === "" ? null : Number(e.target.value),
+              })
+            }
+          />
+          <span>
+            {mode === "skeletalRate" ? "%" : mode === "smi" ? "kg/m²" : "kg"}
+          </span>
+        </div>
+      </Field>
+      {mode !== "skeletalRate" && (
+        <p className="tiny">
+          表示する骨格筋率{mode === "smi" ? "（概算）" : ""}：
+          {skeletalRateOf(preview) ?? "NoData"}％
+          {mode === "smi" && "（身長・体重・測定日が必要です）"}
+        </p>
+      )}
+    </div>
+  );
+}
+function ContactSettings({ ctx }: { ctx: Context }) {
+  const [busy, setBusy] = useState(false),
+    [mails, setMails] = useState<any[]>([]),
+    [show, setShow] = useState(false);
+  const preview = async () => {
+    try {
+      const r = await api("account/mail-preview");
+      setMails(r.mails);
+      setShow(true);
+    } catch (e) {
+      ctx.notify((e as Error).message);
+    }
+  };
+  const verify = async () => {
+    setBusy(true);
+    try {
+      await api("account/email-verification", "POST", {});
+      ctx.notify(
+        ctx.mailMode === "preview"
+          ? "確認メールをデモの受信欄に作成しました。"
+          : "確認メールの送信を受け付けました。",
+      );
+      if (ctx.mailMode === "preview") await preview();
+    } catch (e) {
+      ctx.notify((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const toggle = async (enabled: boolean) => {
+    setBusy(true);
+    try {
+      await api("account/settings", "PATCH", { emailNotifications: enabled });
+      await ctx.refresh();
+    } catch (e) {
+      ctx.notify((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (!ctx.user) return null;
+  return (
+    <section className="contact-settings">
+      <Field label="登録メールアドレス（非公開）">
+        <input type="email" readOnly value={ctx.user.email} />
+      </Field>
+      <p className="tiny muted">
+        {ctx.user.emailVerified
+          ? "メールアドレス確認済み"
+          : "通知を受け取るにはメールアドレスの確認が必要です。"}
+      </p>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          disabled={busy}
+          checked={ctx.user.emailNotifications}
+          onChange={(e) => void toggle(e.target.checked)}
+        />
+        会話の申請・承認・メッセージ受信をメールで通知
+      </label>
+      <p className="tiny muted">
+        通知メールには会話本文・画像・健康情報を含めません。
+        {ctx.mailMode === "unconfigured"
+          ? "現在、運営のメール送信設定が未完了です。"
+          : ctx.mailMode === "preview"
+            ? "デモでは実際に送信せず、受信欄で内容を確認できます。"
+            : ""}
+      </p>
+      <div className="button-row">
+        {!ctx.user.emailVerified && (
+          <button
+            type="button"
+            className="button button-outline"
+            disabled={busy || ctx.mailMode === "unconfigured"}
+            onClick={() => void verify()}
+          >
+            確認メールを送る
+          </button>
+        )}
+        {ctx.mailMode === "preview" && (
+          <button
+            type="button"
+            className="button button-outline"
+            onClick={() => void preview()}
+          >
+            デモのメール受信欄
+          </button>
+        )}
+      </div>
+      {show && (
+        <div className="mail-preview">
+          <h4>メール受信欄（自分宛てのみ）</h4>
+          {mails.length ? (
+            mails.map((m) => (
+              <article key={m.id}>
+                <strong>{m.subject}</strong>
+                <p>
+                  {m.body
+                    .split(/(https?:\/\/[^\s]+)/)
+                    .map((part: string, i: number) =>
+                      /^https?:/.test(part) ? (
+                        <a key={i} href={part}>
+                          {part.includes("/verify-email")
+                            ? "メールアドレスを確認する"
+                            : "会話を開く"}
+                        </a>
+                      ) : (
+                        <span key={i}>{part}</span>
+                      ),
+                    )}
+                </p>
+              </article>
+            ))
+          ) : (
+            <p className="tiny muted">メールはまだありません。</p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+function VerifyEmail({ ctx }: { ctx: Context }) {
+  const params = useSearchParams(),
+    [done, setDone] = useState(false),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const verify = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api("auth/verify-email", "POST", { token: params.get("token") });
+      setDone(true);
+      await ctx.refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="page-shell">
+      <div className="panel">
+        <h1>メールアドレスの確認</h1>
+        {done ? (
+          <>
+            <p>
+              メールアドレスを確認しました。通知設定がオンの場合、会話の受信通知が届きます。
+            </p>
+            <Link className="button" href="/chat">
+              会話を開く
+            </Link>
+          </>
+        ) : (
+          <>
+            <p>このメールアドレスで通知を受け取ることを確認してください。</p>
+            {error && <p role="alert">{error}</p>}
+            <button
+              className="button"
+              disabled={busy || !params.get("token")}
+              onClick={() => void verify()}
+            >
+              メールアドレスを確認
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Registration({ ctx }: { ctx: Context }) {
   const params = useSearchParams();
   const [p, setProfile] = useState<ProfileData>(emptyProfile),
@@ -2251,6 +2689,7 @@ function Registration({ ctx }: { ctx: Context }) {
                 </div>
                 {step === 0 && (
                   <>
+                    <ContactSettings ctx={ctx} />
                     <div className="form-grid">
                       <Field label="身長" required>
                         <div className="input-unit">
@@ -2292,19 +2731,13 @@ function Registration({ ctx }: { ctx: Context }) {
                           <span>%</span>
                         </div>
                       </Field>
-                      <Field label="推定筋肉量" required>
-                        <div className="input-unit">
-                          <input
-                            type="number"
-                            step="0.1"
-                            value={p.muscle}
-                            onChange={(e) =>
-                              set("muscle", Number(e.target.value))
-                            }
-                          />
-                          <span>kg</span>
-                        </div>
-                      </Field>
+                      <SkeletalInput
+                        p={p}
+                        birthDate={ctx.user?.birthDate || ""}
+                        onChange={(patch) =>
+                          setProfile((old) => ({ ...old, ...patch }))
+                        }
+                      />
                       <Field label="体組成の測定日" required>
                         <input
                           type="date"
@@ -2313,12 +2746,50 @@ function Registration({ ctx }: { ctx: Context }) {
                         />
                       </Field>
                       <Field label="髪色">
-                        <Select
+                        <input
                           value={p.hair}
-                          onChange={(v) => set("hair", v)}
-                          options={HAIR}
+                          maxLength={80}
+                          onChange={(e) => set("hair", e.target.value)}
+                          placeholder="黒、茶色など"
                         />
                       </Field>
+                      <Field label="髪質">
+                        <Select
+                          value={p.hairTexture}
+                          onChange={(v) => set("hairTexture", v)}
+                          options={HAIR_TEXTURES}
+                        />
+                      </Field>
+                      <Field label="まぶた">
+                        <Select
+                          value={p.eyelid}
+                          onChange={(v) => set("eyelid", v)}
+                          options={EYELIDS}
+                        />
+                      </Field>
+                      {(["visionLeft", "visionRight"] as const).map((k, i) => (
+                        <Field
+                          key={k}
+                          label={`${i === 0 ? "左" : "右"}目の裸眼視力`}
+                        >
+                          <input
+                            type="number"
+                            min="0"
+                            max="3"
+                            step="0.01"
+                            value={p[k] ?? ""}
+                            onChange={(e) =>
+                              set(
+                                k,
+                                e.target.value === ""
+                                  ? null
+                                  : Number(e.target.value),
+                              )
+                            }
+                            placeholder="未記載"
+                          />
+                        </Field>
+                      ))}
                       <Field label="血液型">
                         <Select
                           value={p.blood}
@@ -2524,103 +2995,103 @@ function Registration({ ctx }: { ctx: Context }) {
                       健康・生活習慣 <span className="optional">一般公開</span>
                     </h3>
                     <div className="form-grid">
-                      <Field label="健康診断日">
-                        <input
-                          type="date"
-                          value={p.healthDate}
-                          onChange={(e) => set("healthDate", e.target.value)}
-                        />
-                      </Field>
-                      <Field label="血圧（収縮期 / 拡張期）">
-                        <div className="range-input">
+                      {(["exercise", "drinking", "smoking"] as const).map(
+                        (k, i) => {
+                          const options = [
+                            ...FREQUENCIES,
+                            ...(k === "smoking"
+                              ? ["吸わない", "過去に喫煙"]
+                              : k === "drinking"
+                                ? ["飲まない"]
+                                : []),
+                          ];
+                          if (!options.includes(p[k])) options.push(p[k]);
+                          return (
+                            <Field
+                              key={k}
+                              label={["運動頻度", "飲酒頻度", "喫煙頻度"][i]}
+                            >
+                              <Select
+                                value={p[k]}
+                                onChange={(v) => set(k, v)}
+                                options={options}
+                              />
+                            </Field>
+                          );
+                        },
+                      )}
+                      <Field
+                        label="飲酒1回あたりの純アルコール量"
+                        note="目安：ビール5％・500mL＝20g。飲料量(mL)×度数÷100×0.8。"
+                      >
+                        <div className="input-unit">
                           <input
-                            aria-label="収縮期血圧"
                             type="number"
-                            placeholder="未記載"
-                            value={p.systolic ?? ""}
+                            step="0.1"
+                            min="0"
+                            max="1000"
+                            value={p.drinkingAmount ?? ""}
                             onChange={(e) =>
                               set(
-                                "systolic",
+                                "drinkingAmount",
                                 e.target.value === ""
                                   ? null
                                   : Number(e.target.value),
                               )
                             }
                           />
-                          <span>/</span>
-                          <input
-                            aria-label="拡張期血圧"
-                            type="number"
-                            placeholder="未記載"
-                            value={p.diastolic ?? ""}
-                            onChange={(e) =>
-                              set(
-                                "diastolic",
-                                e.target.value === ""
-                                  ? null
-                                  : Number(e.target.value),
-                              )
-                            }
-                          />
+                          <span>g</span>
                         </div>
                       </Field>
-                      <Field label="喫煙">
-                        <Select
-                          value={p.smoking}
-                          onChange={(v) => set("smoking", v)}
-                          options={[
-                            "未回答",
-                            "吸わない",
-                            "過去に喫煙",
-                            "喫煙中",
-                          ]}
-                        />
-                      </Field>
-                      <Field label="飲酒頻度">
-                        <Select
-                          value={p.drinking}
-                          onChange={(v) => set("drinking", v)}
-                          options={[
-                            "未回答",
-                            "飲まない",
-                            "月に数回",
-                            "週1〜2日",
-                            "週3〜4日",
-                            "ほぼ毎日",
-                          ]}
-                        />
-                      </Field>
-                      <Field label="運動頻度">
-                        <Select
-                          value={p.exercise}
-                          onChange={(v) => set("exercise", v)}
-                          options={[
-                            "未回答",
-                            "ほぼなし",
-                            "週1〜2日",
-                            "週3〜4日",
-                            "週5日以上",
-                          ]}
-                        />
-                      </Field>
-                      {(
-                        [
-                          ["history", "既往歴"],
-                          ["hereditary", "遺伝性疾患"],
-                          ["allergy", "アレルギー"],
-                        ] as const
-                      ).map(([k, label]) => (
-                        <Field label={label} key={k}>
-                          <Select
-                            value={p[k]}
-                            onChange={(v) => set(k, v)}
-                            options={["未回答", "なし", "あり", "不明"]}
+                      <Field label="喫煙日の喫煙量">
+                        <div className="input-unit">
+                          <input
+                            type="number"
+                            min="0"
+                            max="200"
+                            step="1"
+                            value={p.smokingAmount ?? ""}
+                            onChange={(e) =>
+                              set(
+                                "smokingAmount",
+                                e.target.value === ""
+                                  ? null
+                                  : Number(e.target.value),
+                              )
+                            }
                           />
-                        </Field>
-                      ))}
+                          <span>本／日</span>
+                        </div>
+                      </Field>
+                      <Field label="アルコール耐性">
+                        <Select
+                          value={p.alcoholTolerance}
+                          onChange={(v) => set("alcoholTolerance", v)}
+                          options={TOLERANCES}
+                        />
+                      </Field>
                     </div>
-                    {(p.systolic !== null || p.diastolic !== null) &&
-                      documentInput("health")}
+                    {(
+                      [
+                        ["history", "本人の既往歴"],
+                        ["familyHistory", "親族の既往歴"],
+                        ["allergy", "アレルギー"],
+                      ] as const
+                    ).map(([k, label]) => (
+                      <Field
+                        key={k}
+                        label={label}
+                        note="任意・一般公開（最大1,000字）。本人・親族の氏名や連絡先などは記載しないでください。"
+                      >
+                        <textarea
+                          rows={3}
+                          maxLength={1000}
+                          value={p[k]}
+                          onChange={(e) => set(k, e.target.value)}
+                          placeholder="なし、疾患名など。親族の既往歴は続柄だけを記載"
+                        />
+                      </Field>
+                    ))}
                   </>
                 )}
                 {step === 2 && (
@@ -2791,7 +3262,7 @@ function Registration({ ctx }: { ctx: Context }) {
                       </button>
                     )}
                     <p className="tiny muted">
-                      学校名の指定を除き、プロフィールの自由記述欄はありません。入力内容に虚偽がある場合、掲載を停止することがあります。
+                      髪色、本人・親族の既往歴、アレルギーは自由記述です。これらは一般公開されます。入力内容に虚偽がある場合、掲載を停止することがあります。
                     </p>
                   </>
                 )}
@@ -3080,7 +3551,7 @@ function ChatPage({ ctx }: { ctx: Context }) {
               </div>
               <div className="chat-disclaimer">
                 <Eye size={13} />
-                管理者はこの会話を閲覧できます。メール通知は送信しません。
+                管理者はこの会話を閲覧できます。受信通知は確認済みメールアドレスへ送ります。通知のオン・オフはアカウント画面で変更できます。
               </div>
               {report && !admin && (
                 <div className="chat-report">
@@ -3711,7 +4182,9 @@ function AdminPage({ ctx }: { ctx: Context }) {
               <dt>身体情報</dt>
               <dd>
                 {selected.profile.height}cm / {selected.profile.weight}kg /{" "}
-                {selected.profile.bodyFat}% / 筋肉量{selected.profile.muscle}kg
+                {selected.profile.bodyFat}% / 骨格筋率
+                {skeletalRateOf(selected.profile) ?? "NoData"}
+                {skeletalRateOf(selected.profile) !== null ? "%" : ""}
               </dd>
             </div>
             <div>
@@ -3721,6 +4194,32 @@ function AdminPage({ ctx }: { ctx: Context }) {
             <div>
               <dt>精液検査日</dt>
               <dd>{selected.profile.semenDate}</dd>
+            </div>
+            <div>
+              <dt>骨格筋の入力値</dt>
+              <dd>
+                {selected.profile.skeletalMass !== null
+                  ? `${selected.profile.skeletalMass}kg（全身骨格筋量）`
+                  : selected.profile.skeletalRate !== null
+                    ? `${selected.profile.skeletalRate}％（骨格筋率）`
+                    : selected.profile.smi !== null
+                      ? `${selected.profile.smi}kg/m²（概算用SMI・測定時${selected.profile.bodyAge}歳）`
+                      : "NoData"}
+              </dd>
+            </div>
+            <div>
+              <dt>髪色・髪質・まぶた</dt>
+              <dd>
+                {selected.profile.hair} ／ {selected.profile.hairTexture} ／{" "}
+                {selected.profile.eyelid}
+              </dd>
+            </div>
+            <div>
+              <dt>裸眼視力（左／右）</dt>
+              <dd>
+                {value(selected.profile.visionLeft)} ／{" "}
+                {value(selected.profile.visionRight)}
+              </dd>
             </div>
           </dl>
           <h3>学歴・IQの根拠</h3>
@@ -3799,10 +4298,13 @@ function AdminPage({ ctx }: { ctx: Context }) {
                 "drinking",
                 "exercise",
                 "history",
-                "hereditary",
+                "familyHistory",
                 "allergy",
                 "contactPolicy",
                 "futureInfo",
+                "smokingAmount",
+                "drinkingAmount",
+                "alcoholTolerance",
               ].map((k, i) => (
                 <div key={k}>
                   <dt>
@@ -3812,14 +4314,17 @@ function AdminPage({ ctx }: { ctx: Context }) {
                         "飲酒",
                         "運動",
                         "既往歴",
-                        "遺伝性疾患",
+                        "親族の既往歴",
                         "アレルギー",
                         "連絡方針",
                         "将来の情報提供",
+                        "喫煙量（本／喫煙日）",
+                        "飲酒量（純アルコールg／回）",
+                        "アルコール耐性",
                       ][i]
                     }
                   </dt>
-                  <dd>{selected.profile[k]}</dd>
+                  <dd>{selected.profile[k] ?? "NoData"}</dd>
                 </div>
               ))}
               <div>
@@ -3941,6 +4446,10 @@ function LegalPage({ page }: { page: string }) {
             <h2>公開範囲</h2>
             <p>
               年齢、身体情報、IQの参考値、検査値、健康・生活習慣、提供条件、確認済みの実績は一般公開します。生年月日・メールアドレス・本人確認書類・証明書は公開しません。顔写真・学校名は、本人が許可した会話相手に開示します。
+            </p>
+            <h2>メール通知</h2>
+            <p>
+              確認済みのメールアドレスに、会話の申請・承認・メッセージ受信を通知します。本文・画像・健康情報はメールに含めません。アカウント画面で通知を停止できます。アドレス確認のトークンは24時間有効です。送信済みのメールはメールサービスや受信端末から削除できません。
             </p>
             <h2>書類・画像</h2>
             <p>

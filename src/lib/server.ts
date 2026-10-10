@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import sharp from "sharp";
+import { mailMode, deliverMail } from "./mail";
 import {
   Academic,
   ProfileData,
@@ -23,7 +24,14 @@ import {
   Role,
   PREFECTURES,
   WEEKDAYS,
-  HAIR,
+  FREQUENCIES,
+  HAIR_TEXTURES,
+  EYELIDS,
+  TOLERANCES,
+  normalizeProfile,
+  skeletalRateOf,
+  bodyCategory,
+  semenGrades,
   BLOOD,
   INFECTIONS,
   SEMEN_FIELDS,
@@ -31,6 +39,8 @@ import {
   emptyProfile,
   validDate,
   ageOf,
+  ageAt,
+  estimatedSkeletalMass,
 } from "./shared";
 
 type Row = Record<string, any>;
@@ -88,7 +98,8 @@ function db() {
     CREATE INDEX IF NOT EXISTS message_time ON messages(conversation_id,created_at);
     CREATE INDEX IF NOT EXISTS file_owner ON files(owner_id);
     CREATE INDEX IF NOT EXISTS applications_owner ON applications(user_id,created_at);
-    PRAGMA user_version=1;`);
+    `);
+  migrate();
   const catalogFile = path.join(process.cwd(), "catalog", "current.json");
   if (existsSync(catalogFile)) {
     const imported = JSON.parse(readFileSync(catalogFile, "utf8"));
@@ -120,7 +131,7 @@ function db() {
     if (password.length < 12)
       throw new Error("ADMIN_PASSWORDは12文字以上に設定してください。");
     run(
-      "INSERT INTO users VALUES(?,?,?,?,?,?,?,?)",
+      "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
       id(),
       email,
       passwordHash(password),
@@ -132,8 +143,197 @@ function db() {
     );
   }
   cleanFiles();
+  startMailWorker();
   return instance;
 }
+function migrate() {
+  const version = Number(one("PRAGMA user_version")?.user_version || 0);
+  if (version >= 2) return;
+  transaction(() => {
+    const columns = all("PRAGMA table_info(users)").map((x) => x.name);
+    if (!columns.includes("email_verified"))
+      run(
+        "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0",
+      );
+    if (!columns.includes("email_notifications"))
+      run(
+        "ALTER TABLE users ADD COLUMN email_notifications INTEGER NOT NULL DEFAULT 1",
+      );
+    db()
+      .exec(`CREATE TABLE IF NOT EXISTS email_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,email TEXT NOT NULL,expires_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS mail_queue(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,kind TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);`);
+    for (const row of all("SELECT * FROM profiles")) {
+      const normalize = (json: string | null) => {
+        if (!json) return null;
+        const raw = JSON.parse(json),
+          p = normalizeProfile(raw);
+        if (raw.hereditary && raw.hereditary !== "未回答")
+          p.history =
+            `${p.history || ""}\n旧形式の遺伝性疾患申告：${raw.hereditary}`.trim();
+        if (/^demo_donor[123]$/.test(row.user_id) && raw.muscle !== undefined)
+          p.skeletalRate = [36.2, 34.1, 38.5][
+            Number(row.user_id.slice(-1)) - 1
+          ];
+        return JSON.stringify(p);
+      };
+      run(
+        "UPDATE profiles SET data_json=?,approved_json=? WHERE user_id=?",
+        normalize(row.data_json),
+        normalize(row.approved_json),
+        row.user_id,
+      );
+    }
+    for (const row of all("SELECT id,data_json FROM applications"))
+      run(
+        "UPDATE applications SET data_json=? WHERE id=?",
+        JSON.stringify(normalizeProfile(JSON.parse(row.data_json))),
+        row.id,
+      );
+    run(
+      "UPDATE users SET email_verified=1 WHERE id LIKE 'demo_%' AND email LIKE '%@example.test'",
+    );
+    db().exec("PRAGMA user_version=2");
+  });
+}
+let mailFlushing = false;
+async function flushMail() {
+  if (mailFlushing || mailMode() !== "smtp") return;
+  mailFlushing = true;
+  try {
+    for (let batch = 0; batch < 4; batch++) {
+      const pending = all(
+        "SELECT * FROM mail_queue WHERE status='queued' AND next_attempt<=? ORDER BY created_at LIMIT 30",
+        Date.now(),
+      );
+      if (!pending.length) break;
+      for (const item of pending) {
+        const user = one("SELECT * FROM users WHERE id=?", item.user_id);
+        const chat = item.conversation_id
+          ? one(
+              "SELECT status FROM conversations WHERE id=?",
+              item.conversation_id,
+            )
+          : null;
+        if (
+          !user ||
+          (item.kind !== "verify" &&
+            (!user.email_verified ||
+              !user.email_notifications ||
+              !chat ||
+              !["accepted", "requested"].includes(chat.status)))
+        ) {
+          run("DELETE FROM mail_queue WHERE id=?", item.id);
+          continue;
+        }
+        if (
+          item.kind === "verify" &&
+          !one(
+            "SELECT token_hash FROM email_tokens WHERE user_id=? AND email=? AND expires_at>?",
+            user.id,
+            user.email,
+            now(),
+          )
+        ) {
+          run("DELETE FROM mail_queue WHERE id=?", item.id);
+          continue;
+        }
+        try {
+          await deliverMail(user.email, item.subject, item.body);
+          run("DELETE FROM mail_queue WHERE id=?", item.id);
+        } catch {
+          const attempts = item.attempts + 1;
+          run(
+            "UPDATE mail_queue SET attempts=?,next_attempt=?,status=? WHERE id=?",
+            attempts,
+            Date.now() + Math.min(3600000, 60000 * 2 ** attempts),
+            attempts >= 5 ? "failed" : "queued",
+            item.id,
+          );
+        }
+      }
+    }
+  } finally {
+    mailFlushing = false;
+  }
+}
+function enqueueMail(
+  uid: string,
+  kind: string,
+  subject: string,
+  content: string,
+  conversationId: string | null = null,
+) {
+  if (mailMode() === "unconfigured") return;
+  const user = one("SELECT * FROM users WHERE id=?", uid);
+  if (
+    !user ||
+    (kind !== "verify" && (!user.email_verified || !user.email_notifications))
+  )
+    return;
+  run(
+    "INSERT INTO mail_queue(id,user_id,conversation_id,kind,subject,body,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+    id(),
+    uid,
+    conversationId,
+    kind,
+    subject,
+    content,
+    mailMode() === "preview" ? "preview" : "queued",
+    now(),
+  );
+  void flushMail();
+}
+function verifyEmail(user: Row) {
+  if (mailMode() === "unconfigured")
+    fail(503, "メール送信が未設定です。運営者にお問い合わせください。");
+  rate("verify-email:" + user.id, 3, 3600000);
+  const token = randomBytes(32).toString("hex");
+  transaction(() => {
+    run("DELETE FROM email_tokens WHERE user_id=?", user.id);
+    run("DELETE FROM mail_queue WHERE user_id=? AND kind='verify'", user.id);
+    run(
+      "INSERT INTO email_tokens VALUES(?,?,?,?)",
+      hash(token),
+      user.id,
+      user.email,
+      new Date(Date.now() + 86400000).toISOString(),
+    );
+    enqueueMail(
+      user.id,
+      "verify",
+      "コウノトリのつばさ：メールアドレスの確認",
+      `登録メールアドレスを確認してください。リンクは24時間有効です。\n${siteUrl()}/verify-email?token=${token}\n心当たりがなければ、このメールを破棄してください。`,
+    );
+  });
+}
+function siteUrl() {
+  return (process.env.SITE_URL || "").replace(/\/$/, "");
+}
+function chatMail(uid: string, cid: string, kind: string) {
+  const label =
+    kind === "request"
+      ? "会話の申請が届きました"
+      : kind === "accept"
+        ? "会話の申請が承認されました"
+        : "新しいメッセージが届きました";
+  enqueueMail(
+    uid,
+    kind,
+    `コウノトリのつばさ：${label}`,
+    `${label}。ログインして確認してください。\n${siteUrl()}/chat?conversation=${cid}\n通知設定はアカウント画面から変更できます。`,
+    cid,
+  );
+}
+let mailTimer: ReturnType<typeof setInterval> | undefined;
+function startMailWorker() {
+  if (mailTimer || mailMode() !== "smtp") return;
+  mailTimer = setInterval(() => {
+    void flushMail();
+  }, 60000);
+  mailTimer.unref();
+  void flushMail();
+}
+
 function one(sql: string, ...params: any[]): Row | undefined {
   return db()
     .prepare(sql)
@@ -195,7 +395,7 @@ function seedDemo() {
   ];
   for (const u of users)
     run(
-      "INSERT INTO users VALUES(?,?,?,?,?,?,?,?)",
+      "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
       u[0],
       u[1],
       passwordHash(randomBytes(24).toString("hex")),
@@ -205,6 +405,7 @@ function seedDemo() {
       now(),
       now(),
     );
+  run("UPDATE users SET email_verified=1 WHERE id LIKE 'demo_%'");
   const date = now().slice(0, 10);
   for (let i = 1; i <= 3; i++) {
     const p = emptyProfile();
@@ -212,7 +413,11 @@ function seedDemo() {
       height: [178, 173, 182][i - 1],
       weight: [72, 66, 78][i - 1],
       bodyFat: [16.5, 19.2, 14.8][i - 1],
-      muscle: [34.2, 29.8, 38.1][i - 1],
+      skeletalRate: [36.2, 34.1, 38.5][i - 1],
+      hairTexture: "直毛・柔毛",
+      eyelid: "二重",
+      visionLeft: 1,
+      visionRight: 1,
       bodyDate: date,
       blood: ["A", "O", "B"][i - 1],
       residence: ["東京都", "神奈川県", "大阪府"][i - 1],
@@ -232,14 +437,12 @@ function seedDemo() {
       infections: Object.fromEntries(
         INFECTIONS.map((x) => [x, i === 3 ? "未検査・未提出" : "陰性"]),
       ),
-      healthDate: date,
-      systolic: 118,
-      diastolic: 76,
+
       smoking: "吸わない",
-      drinking: "週1〜2日",
-      exercise: "週3〜4日",
+      drinking: "週2日",
+      exercise: "週3日",
       history: "なし",
-      hereditary: "なし",
+      familyHistory: "なし",
       allergy: "なし",
       contactPolicy: "妊娠結果まで",
       futureInfo: "対応可",
@@ -292,6 +495,8 @@ function publicUser(row: Row): User {
     role: row.role,
     displayId: row.display_id,
     birthDate: row.birth_date,
+    emailVerified: !!row.email_verified,
+    emailNotifications: !!row.email_notifications,
   };
 }
 function sessionUser(req: Request) {
@@ -443,19 +648,47 @@ function regions(value: any) {
     return r;
   });
 }
-function profileData(input: Row, previous?: ProfileData): ProfileData {
+function profileData(
+  input: Row,
+  previous: ProfileData | undefined,
+  birthDate: string,
+): ProfileData {
   const p = emptyProfile();
   for (const [key, min, max, label] of [
     ["height", 100, 250, "身長"],
     ["weight", 25, 300, "体重"],
     ["bodyFat", 1, 75, "体脂肪率"],
-    ["muscle", 1, 200, "推定筋肉量"],
   ] as const)
     p[key] = numeric(input[key], min, max, label)!;
-  if (p.muscle > p.weight)
-    fail(400, "推定筋肉量は体重以下の値にしてください。");
+  p.skeletalMass = numeric(
+    input.skeletalMass,
+    1,
+    p.weight,
+    "全身の骨格筋量",
+    true,
+  );
+  p.skeletalRate = numeric(input.skeletalRate, 1, 100, "骨格筋率", true);
+  p.smi = numeric(input.smi, 0.1, 30, "四肢由来のSMI", true);
+  if (
+    [p.skeletalMass, p.skeletalRate, p.smi].filter((x) => x !== null).length !==
+    1
+  )
+    fail(
+      400,
+      "全身の骨格筋量・骨格筋率・四肢由来SMIのいずれか1つだけを入力してください。",
+    );
+  p.visionLeft = numeric(input.visionLeft, 0, 3, "左目の裸眼視力", true);
+  p.visionRight = numeric(input.visionRight, 0, 3, "右目の裸眼視力", true);
+  p.hairTexture = choice(input.hairTexture || "未回答", HAIR_TEXTURES, "髪質");
+  p.eyelid = choice(input.eyelid || "未回答", EYELIDS, "まぶた");
   p.bodyDate = date(input.bodyDate, true);
-  p.hair = choice(input.hair, HAIR, "髪色");
+  p.bodyAge = p.smi !== null ? ageAt(birthDate, p.bodyDate) : null;
+  if (p.smi !== null && estimatedSkeletalMass(p) === null)
+    fail(
+      400,
+      "SMIによる概算は測定時18歳以上・BMI35未満が対象です。値や単位を確認するか、骨格筋量・骨格筋率を登録してください。",
+    );
+  p.hair = text(input.hair || "", 80);
   p.blood = choice(input.blood, BLOOD, "血液型");
   p.residence = choice(input.residence, PREFECTURES, "居住都道府県");
   p.methods = choices(input.methods, ["シリンジ法", "タイミング法"]);
@@ -563,28 +796,39 @@ function profileData(input: Row, previous?: ProfileData): ProfileData {
     !p.infectionDate
   )
     fail(400, "感染症の検査日を入力してください。");
-  p.healthDate = date(input.healthDate);
-  p.systolic = numeric(input.systolic, 30, 300, "収縮期血圧", true);
-  p.diastolic = numeric(input.diastolic, 10, 200, "拡張期血圧", true);
-  if ((p.systolic !== null || p.diastolic !== null) && !p.healthDate)
-    fail(400, "健康診断日を入力してください。");
-  p.smoking = choice(
-    input.smoking,
-    ["未回答", "吸わない", "過去に喫煙", "喫煙中"],
-    "喫煙",
+  const frequency = (
+    key: "smoking" | "drinking" | "exercise",
+    extra: string[],
+  ) => {
+    const options = [...FREQUENCIES, ...extra];
+    if (
+      previous &&
+      !options.includes(previous[key]) &&
+      input[key] === previous[key]
+    )
+      return previous[key];
+    return choice(input[key], options, key);
+  };
+  p.smoking = frequency("smoking", ["吸わない", "過去に喫煙"]);
+  p.drinking = frequency("drinking", ["飲まない"]);
+  p.exercise = frequency("exercise", []);
+  p.smokingAmount = numeric(input.smokingAmount, 0, 200, "喫煙日の本数", true);
+  if (p.smokingAmount !== null && !Number.isInteger(p.smokingAmount))
+    fail(400, "喫煙本数は整数で入力してください。");
+  p.drinkingAmount = numeric(
+    input.drinkingAmount,
+    0,
+    1000,
+    "飲酒1回の純アルコール量",
+    true,
   );
-  p.drinking = choice(
-    input.drinking,
-    ["未回答", "飲まない", "月に数回", "週1〜2日", "週3〜4日", "ほぼ毎日"],
-    "飲酒",
+  p.alcoholTolerance = choice(
+    input.alcoholTolerance || "不明",
+    TOLERANCES,
+    "アルコール耐性",
   );
-  p.exercise = choice(
-    input.exercise,
-    ["未回答", "ほぼなし", "週1〜2日", "週3〜4日", "週5日以上"],
-    "運動",
-  );
-  for (const k of ["history", "hereditary", "allergy"] as const)
-    p[k] = choice(input[k], ["未回答", "なし", "あり", "不明"], k);
+  for (const k of ["history", "familyHistory", "allergy"] as const)
+    p[k] = text(input[k] || "", 1000);
   p.contactPolicy = choice(
     input.contactPolicy,
     ["提供時のみ", "妊娠結果まで", "出産後も相談可"],
@@ -610,7 +854,7 @@ function iqOf(p: ProfileData) {
   return values.length ? Math.max(...values) : null;
 }
 function donor(row: Row, viewer?: Row): Donor {
-  const p = JSON.parse(row.approved_json) as ProfileData;
+  const p = normalizeProfile(JSON.parse(row.approved_json));
   const granted =
     viewer &&
     (viewer.id === row.id ||
@@ -624,9 +868,11 @@ function donor(row: Row, viewer?: Row): Donor {
     "SELECT SUM(CASE WHEN kind='donation' THEN 1 ELSE 0 END) donations,SUM(CASE WHEN kind='birth' THEN 1 ELSE 0 END) births FROM events WHERE donor_id=? AND status='confirmed'",
     row.id,
   );
-  const { academics, ...publicData } = p;
+  const { academics, smi, bodyAge, ...publicData } = p;
   return {
     ...publicData,
+    skeletalRate: skeletalRateOf(p),
+    skeletalEstimated: smi !== null,
     id: row.id,
     displayId: row.display_id,
     age: ageOf(row.birth_date),
@@ -676,7 +922,10 @@ const protectedFields = [
   "height",
   "weight",
   "bodyFat",
-  "muscle",
+  "skeletalMass",
+  "skeletalRate",
+  "smi",
+  "bodyAge",
   "bodyDate",
   "blood",
   "academics",
@@ -684,12 +933,6 @@ const protectedFields = [
   "semenDate",
   "infections",
   "infectionDate",
-  "healthDate",
-  "systolic",
-  "diastolic",
-  "history",
-  "hereditary",
-  "allergy",
 ];
 function equalFields(a: Row, b: Row, keys: string[]) {
   return keys.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
@@ -723,7 +966,10 @@ function ensureDocuments(
       "height",
       "weight",
       "bodyFat",
-      "muscle",
+      "skeletalMass",
+      "skeletalRate",
+      "smi",
+      "bodyAge",
       "bodyDate",
     ])
   )
@@ -735,12 +981,6 @@ function ensureDocuments(
     (!previous || !equalFields(p, previous, ["infections", "infectionDate"]))
   )
     requireDoc("infection");
-  if (
-    (p.systolic !== null || p.diastolic !== null) &&
-    (!previous ||
-      !equalFields(p, previous, ["healthDate", "systolic", "diastolic"]))
-  )
-    requireDoc("health");
   return files;
 }
 let paypalToken: { value: string; expires: number } | undefined;
@@ -844,6 +1084,7 @@ export async function handle(req: Request, parts: string[]) {
       return json({
         user: u ? publicUser(u) : null,
         demo: demo(),
+        mailMode: mailMode(),
         paymentMode: process.env.PAYMENT_MODE || "paypal",
       });
     }
@@ -885,7 +1126,7 @@ export async function handle(req: Request, parts: string[]) {
           randomBytes(3).toString("hex").toUpperCase();
       transaction(() => {
         run(
-          "INSERT INTO users VALUES(?,?,?,?,?,?,?,?)",
+          "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
           uid,
           email,
           passwordHash(password),
@@ -905,7 +1146,69 @@ export async function handle(req: Request, parts: string[]) {
             0,
           );
       });
-      return loginResponse(one("SELECT * FROM users WHERE id=?", uid)!, req);
+      const created = one("SELECT * FROM users WHERE id=?", uid)!;
+      if (mailMode() !== "unconfigured") verifyEmail(created);
+      return loginResponse(created, req);
+    }
+    if (key === "auth/verify-email" && method === "POST") {
+      const b = await body(req),
+        token = text(b.token, 64);
+      if (!/^[a-f0-9]{64}$/.test(token)) fail(400, "確認リンクが無効です。");
+      const item = one(
+        "SELECT * FROM email_tokens WHERE token_hash=? AND expires_at>?",
+        hash(token),
+        now(),
+      );
+      if (!item)
+        fail(400, "確認リンクが無効か期限切れです。再送してください。");
+      transaction(() => {
+        run(
+          "UPDATE users SET email_verified=1 WHERE id=? AND email=?",
+          item.user_id,
+          item.email,
+        );
+        run("DELETE FROM email_tokens WHERE user_id=?", item.user_id);
+        run(
+          "DELETE FROM mail_queue WHERE user_id=? AND kind='verify'",
+          item.user_id,
+        );
+      });
+      return json({ ok: true });
+    }
+    if (key === "account/email-verification" && method === "POST") {
+      const u = needUser(req);
+      if (!u.email_verified) verifyEmail(u);
+      return json({ ok: true, mailMode: mailMode() });
+    }
+    if (key === "account/settings" && method === "PATCH") {
+      const u = needUser(req),
+        b = await body(req);
+      if (typeof b.emailNotifications !== "boolean")
+        fail(400, "通知設定を確認してください。");
+      transaction(() => {
+        run(
+          "UPDATE users SET email_notifications=? WHERE id=?",
+          Number(b.emailNotifications),
+          u.id,
+        );
+        if (!b.emailNotifications)
+          run(
+            "DELETE FROM mail_queue WHERE user_id=? AND kind!='verify'",
+            u.id,
+          );
+      });
+      return json({ ok: true });
+    }
+    if (key === "account/mail-preview" && method === "GET") {
+      const u = needUser(req);
+      if (!demo() || mailMode() !== "preview")
+        fail(404, "この操作は利用できません。");
+      return json({
+        mails: all(
+          "SELECT id,subject,body,created_at FROM mail_queue WHERE user_id=? AND status='preview' ORDER BY created_at DESC LIMIT 20",
+          u.id,
+        ),
+      });
     }
     if (key === "auth/login" && method === "POST") {
       const b = await body(req),
@@ -987,8 +1290,29 @@ export async function handle(req: Request, parts: string[]) {
         rows = rows.filter((d) =>
           INFECTIONS.every((k) => d.infections[k] === "陰性"),
         );
+      const fat = url.searchParams.get("bodyFatCategory"),
+        skeletal = url.searchParams.get("skeletalCategory"),
+        grade = url.searchParams.get("semenGrade");
+      if (fat)
+        rows = rows.filter((d) => bodyCategory(d.bodyFat, "fat") === fat);
+      if (skeletal)
+        rows = rows.filter(
+          (d) => bodyCategory(skeletalRateOf(d), "skeletal") === skeletal,
+        );
+      if (grade)
+        rows = rows.filter((d) =>
+          grade === "良"
+            ? semenGrades(d.semen).good
+            : grade === "秀" && semenGrades(d.semen).excellent,
+        );
       if (url.searchParams.get("sort") === "height")
         rows.sort((a, b) => b.height - a.height);
+      else if (url.searchParams.get("sort") === "iq")
+        rows.sort(
+          (a, b) =>
+            (b.iq ?? -Infinity) - (a.iq ?? -Infinity) ||
+            a.displayId.localeCompare(b.displayId),
+        );
       else if (url.searchParams.get("sort") === "age")
         rows.sort((a, b) => a.age - b.age);
       else
@@ -1016,8 +1340,10 @@ export async function handle(req: Request, parts: string[]) {
       const u = needUser(req, "donor"),
         p = one("SELECT * FROM profiles WHERE user_id=?", u.id)!;
       return json({
-        profile: JSON.parse(p.data_json),
-        approved: p.approved_json ? JSON.parse(p.approved_json) : null,
+        profile: normalizeProfile(JSON.parse(p.data_json)),
+        approved: p.approved_json
+          ? normalizeProfile(JSON.parse(p.approved_json))
+          : null,
         status: p.status,
         verified: !!p.verified,
         photoId: p.photo_id,
@@ -1038,6 +1364,7 @@ export async function handle(req: Request, parts: string[]) {
         p = profileData(
           b.profile,
           current.approved_json ? JSON.parse(current.approved_json) : undefined,
+          u.birth_date,
         );
       if (b.publish === true) {
         if (!current.approved_json) fail(409, "先に登録審査を受けてください。");
@@ -1078,6 +1405,7 @@ export async function handle(req: Request, parts: string[]) {
         p = profileData(
           b.profile,
           current.approved_json ? JSON.parse(current.approved_json) : undefined,
+          u.birth_date,
         );
       if (
         one(
@@ -1137,7 +1465,11 @@ export async function handle(req: Request, parts: string[]) {
           "SELECT approved_json FROM profiles WHERE user_id=?",
           u.id,
         )?.approved_json,
-        p = profileData(b.profile, prev ? JSON.parse(prev) : undefined);
+        p = profileData(
+          b.profile,
+          prev ? JSON.parse(prev) : undefined,
+          u.birth_date,
+        );
       const oldFiles = all(
           "SELECT * FROM files WHERE application_id=?",
           app.id,
@@ -1485,6 +1817,7 @@ export async function handle(req: Request, parts: string[]) {
         "requested",
         now(),
       );
+      chatMail(p.user_id, cid, "request");
       return json({ conversationId: cid }, 201);
     }
     if (parts[0] === "conversations" && parts.length === 2) {
@@ -1514,6 +1847,7 @@ export async function handle(req: Request, parts: string[]) {
             b.action === "accept" ? "accepted" : "declined",
             c.id,
           );
+          if (b.action === "accept") chatMail(c.recipient_id, c.id, "accept");
         } else if (b.action === "disclose") {
           if (c.donor_id !== u.id || c.status !== "accepted")
             fail(403, "提供者のみ開示を変更できます。");
@@ -1567,6 +1901,11 @@ export async function handle(req: Request, parts: string[]) {
         message,
         fid,
         now(),
+      );
+      chatMail(
+        c.donor_id === u.id ? c.recipient_id : c.donor_id,
+        c.id,
+        "message",
       );
       return json({ id: mid }, 201);
     }

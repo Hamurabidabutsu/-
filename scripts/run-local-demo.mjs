@@ -68,6 +68,8 @@ async function main() {
     ...process.env,
     APP_MODE: "demo",
     PAYMENT_MODE: "demo",
+    MAIL_MODE: "preview",
+    SMTP_HOST: "", SMTP_USER: "", SMTP_PASSWORD: "", MAIL_FROM: "",
     DATA_DIR: path.join(root, "data", "local-demo"),
     SITE_URL: url,
     PAYPAL_CLIENT_ID: "",

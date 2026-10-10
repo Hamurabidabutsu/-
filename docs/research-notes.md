@@ -34,3 +34,15 @@
 - 決済サービスによる本事業の利用可否の個別確認。
 
 類似サービスの機能や検査要件を、未取得のページに基づいて記載しない。
+
+## 2026-10-10：今回の検索・体組成の確認
+
+WHO『WHO laboratory manual for the examination and processing of human semen, Sixth Edition』の[公式出版ページ](https://www.who.int/publications/i/item/9789240030787)と[英語本文](https://iris.who.int/server/api/core/bitstreams/4038e736-37b3-4064-a39a-60475e0ccecc/content)を確認。本文p.213、表8.3の5th percentileは精液量1.4mL、濃度16百万/mL、総数39百万、総運動率42％、前進運動率30％、正常形態率4％。これらは自然妊娠に至った集団の分布の参考下限で、妊孕性の合否判定ではない。サイトの「良」は依頼どおり6項目すべての**厳密な超過**、「秀」は依頼指定の5項目の**以上**で独立判定する。
+
+タニタ[MC-780A-N公式製品ページ](https://www.tanita.co.jp/product/business/bodycompositionanalyzer/4107)から[公式取扱説明書](https://api-img.tanita.co.jp/v=1666504375/files/user/support/manual/mc_series/mc780an.pdf)と[カタログ](https://api-img.tanita.co.jp/v=1790753321/files/user/catalog/mc780an_zaRitz_catalog.pdf)を確認。取扱説明書では一般的な「筋肉量」に骨格筋・心筋・平滑筋とその水分を含むと説明し、四肢骨格筋量は左右の腕・脚の筋肉量合計、SMIはその合計÷身長(m)²と定義する。MC-780A-NではSMIが測定値として出力される。家庭用を含むすべてのタニタ機器がSMIを出せるという意味ではない。
+
+SMI×身長(m)²から求まるのは四肢量であり、直接全身の骨格筋率になるわけではない。[Kimら（2002）、doi:10.1093/ajcn/76.2.378](https://doi.org/10.1093/ajcn/76.2.378)のDXAの四肢除脂肪軟部組織量（ALST）から全身骨格筋量を推定する研究はBMI35未満の成人を対象としている。式は[Zhaoら（2013）、表4](https://doi.org/10.1371/journal.pone.0053561)の全文・表で確認し、成人男性用 `SM(kg) = 1.13 × ALST(kg) − 0.02 × 年齢 + 1.58` を採用する。確認した全文は[Europe PMCの公開XML](https://www.ebi.ac.uk/europepmc/webservices/rest/PMC3538629/fullTextXML)。
+
+ユーザーが概算を許容したため、SMIからの四肢量をALSTの代理値として代入し、体重との比を全身骨格筋率の参考値にする。測定時年齢は生年月日と測定日から計算する。この代入は本サイトの近似であり、BIA由来のタニタの四肢量をDXAのALSTと同一と検証したものではない。日本人・家庭用機器での換算精度は未検証。対象外・欠測・非正の推定値・体重を超える推定値は計算しない。SMIによる登録には測定時18歳以上・BMI35未満という条件を設ける。公開画面で「概算」と注記し、ヘルプ・登録画面・公開画面に近似方法と精度の限界を説明する。一般の全身筋肉量MMだけを全身骨格筋量へ変える根拠を確認できた式は見つからず、未知の固定係数は作らない。
+
+IQ順位はユーザーが指定した平均100・標準偏差18の正規分布を仮定した参考割合。学歴集団から実際に測定した順位や、子どもの能力の予測値ではない。偏差値表示は指定式の逆算値を使用する。

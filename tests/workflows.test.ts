@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { verifiedCapture } from "../src/lib/server";
-import { emptyProfile, validDate, ageOf } from "../src/lib/shared";
+import { emptyProfile, validDate, ageOf, ageAt } from "../src/lib/shared";
 
 const directory = mkdtempSync(path.join(tmpdir(), "kounotori-test-"));
 const port = 3217,
@@ -21,6 +21,9 @@ before(async () => {
         ...process.env,
         APP_MODE: "demo",
         PAYMENT_MODE: "demo",
+        MAIL_MODE: "preview",
+        SMTP_HOST: "",
+        MAIL_FROM: "",
         DATA_DIR: directory,
         SITE_URL: origin,
       },
@@ -250,8 +253,23 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
     outsider = await signup("outsider@example.test", "recipient");
   const admin = await call("auth/demo", "POST", { role: "admin" });
   const profile = emptyProfile();
+  profile.skeletalRate = 35;
   Object.assign(profile, {
     bodyDate: "2026-10-01",
+    hair: "黒（自然色）",
+    hairTexture: "ややくせ毛・硬毛",
+    eyelid: "奥二重",
+    visionLeft: 0.7,
+    visionRight: 1.2,
+    history: "本人の既往歴\nなし",
+    familyHistory: "父：喘息",
+    allergy: "花粉",
+    exercise: "週7日",
+    drinking: "月3回",
+    smoking: "月1回",
+    drinkingAmount: 20,
+    smokingAmount: 2,
+    alcoholTolerance: "弱い",
     weekdays: ["土", "祝"],
     normalRegions: [{ prefecture: "東京都", area: "全域" }],
     travelRegions: [{ prefecture: "東京都", area: "全域" }],
@@ -275,6 +293,61 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
     { profile: { ...profile, academics: [] } },
     d.cookie,
     400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    { profile: { ...profile, skeletalMass: 20 } },
+    d.cookie,
+    400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    { profile: { ...profile, smokingAmount: 1.5 } },
+    d.cookie,
+    400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    { profile: { ...profile, smi: 8 } },
+    d.cookie,
+    400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    { profile: { ...profile, skeletalRate: null, smi: 8, weight: 120 } },
+    d.cookie,
+    400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    {
+      profile: {
+        ...profile,
+        skeletalRate: null,
+        smi: 8,
+        bodyDate: "2000-01-01",
+      },
+    },
+    d.cookie,
+    400,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    { profile: { ...profile, skeletalRate: null, smi: 8, bodyAge: 500 } },
+    d.cookie,
+  );
+  const estimateDraft = (await call("profile", "GET", undefined, d.cookie))
+    .profile;
+  assert.equal(estimateDraft.smi, 8);
+  assert.equal(
+    estimateDraft.bodyAge,
+    ageAt(d.user.birthDate, profile.bodyDate),
   );
   const docs = [];
   for (const kind of ["identity", "body", "highschool", "semen"])
@@ -334,6 +407,37 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
   assert.equal(published.birthDate, undefined);
   assert.equal(published.email, undefined);
   assert.equal(published.academics, undefined);
+  assert.equal(published.hair, "黒（自然色）");
+  assert.equal(published.familyHistory, "父：喘息");
+  assert.equal(published.visionLeft, 0.7);
+  assert.equal(published.skeletalRate, 35);
+  assert.equal(published.drinkingAmount, 20);
+  assert.equal(published.smokingAmount, 2);
+  assert.equal("systolic" in published, false);
+  assert.equal("hereditary" in published, false);
+  assert.equal("muscle" in published, false);
+  assert.ok(
+    (
+      await call(
+        "donors?skeletalCategory=" +
+          encodeURIComponent("標準") +
+          "&bodyFatCategory=" +
+          encodeURIComponent("標準"),
+      )
+    ).donors.some((x: any) => x.id === d.user.id),
+  );
+  assert.ok(
+    !(await call("donors?semenGrade=" + encodeURIComponent("良"))).donors.some(
+      (x: any) => x.id === d.user.id,
+    ),
+  );
+  const sorted = (await call("donors?sort=iq")).donors.map(
+    (x: any) => x.iq ?? -Infinity,
+  );
+  assert.deepEqual(
+    sorted,
+    [...sorted].sort((a, b) => b - a),
+  );
   // Unchanged manually verified academic reference must survive free availability edits.
   await call(
     "profile",
@@ -347,6 +451,9 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
     frequency: 2,
     bodyDate: "2026-10-02",
     weight: 66,
+    skeletalRate: null,
+    smi: 8,
+    bodyAge: 999,
   };
   const bodyDoc = await upload("body", d.cookie);
   const update = await call(
@@ -393,6 +500,16 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
     "PATCH",
     { action: "approve", confirmed: true },
     admin.cookie,
+  );
+  const estimated = (await call("donors/" + d.user.id)).donor;
+  assert.equal(estimated.skeletalEstimated, true);
+  assert.equal(estimated.skeletalRate, 40.9);
+  assert.equal("bodyAge" in estimated, false);
+  assert.equal("smi" in estimated, false);
+  assert.ok(
+    (
+      await call("donors?skeletalCategory=" + encodeURIComponent("高い"))
+    ).donors.some((x: any) => x.id === d.user.id),
   );
   await call(
     "admin/donors/" + d.user.id,

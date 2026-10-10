@@ -1581,7 +1581,7 @@ button a {
 .academic-block p {
   margin-bottom: 0;
 }
-.academic-editor .field:last-child {
+.academic-editor .field-shell:last-child {
   margin-bottom: 0;
 }
 .document-upload {
@@ -3610,4 +3610,100 @@ button a {
   .button:hover {
     transform: none;
   }
+}
+
+/* Dictionary help works with touch, keyboard and pointer. */
+.field-shell {
+  position: relative;
+  min-width: 0;
+}
+.has-help .field > span {
+  padding-right: 30px;
+}
+.field-help {
+  position: absolute;
+  top: -5px;
+  right: 0;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  color: var(--green, #4c6651);
+  background: transparent;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.field-help:focus-visible {
+  outline: 2px solid #516c56;
+  outline-offset: 2px;
+}
+.help-text {
+  font-size: 14px;
+  line-height: 2;
+}
+.iq-values {
+  display: block;
+}
+.iq-values small {
+  display: block;
+  margin-top: 5px;
+}
+.definition-list dd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.field textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 88px;
+  font: inherit;
+  border: 1px solid #dfe4da;
+  border-radius: 7px;
+  padding: 12px;
+}
+.contact-settings {
+  border-bottom: 1px solid #e4e7dd;
+  margin-bottom: 22px;
+  padding-bottom: 20px;
+}
+.contact-settings .button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.mail-preview {
+  margin-top: 16px;
+}
+.mail-preview article {
+  border: 1px solid #e4e7dd;
+  padding: 12px;
+  border-radius: 7px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.mail-preview p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mail-preview a {
+  text-decoration: underline;
+}
+.semen-flags {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.card-iq {
+  font-size: 12px;
+  padding: 0 0 16px;
+  color: #53694e;
+}
+.card-iq small {
+  font-size: 10px;
+  font-weight: normal;
 }
