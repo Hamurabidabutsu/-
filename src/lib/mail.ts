@@ -22,20 +22,27 @@ export async function deliverMail(to: string, subject: string, text: string) {
     auth: process.env.SMTP_USER
       ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD }
       : undefined,
-    connectionTimeout: 5000,
-    greetingTimeout: 5000,
-    socketTimeout: 10000,
+    connectionTimeout: 3000,
+    greetingTimeout: 3000,
+    socketTimeout: 5000,
   });
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    await transport.sendMail({
-      from: process.env.MAIL_FROM!,
-      to,
-      subject,
-      text,
-      disableFileAccess: true,
-      disableUrlAccess: true,
-    });
+    await Promise.race([
+      transport.sendMail({
+        from: process.env.MAIL_FROM!,
+        to,
+        subject,
+        text,
+        disableFileAccess: true,
+        disableUrlAccess: true,
+      }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("SMTP timeout")), 8000);
+      }),
+    ]);
   } finally {
+    clearTimeout(timeout);
     transport.close();
   }
 }

@@ -1,0 +1,14 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "24"
+  STORAGE_BACKEND = "netlify"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["sharp"]
+
+# Account credentials and APP_MODE are entered in Netlify, never committed here.
+# The scheduled function first checks Blobs and leaves an idle database asleep.

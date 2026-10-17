@@ -12,6 +12,7 @@ import {
   type ReactElement,
 } from "react";
 import Link from "next/link";
+import SupportPage from "./Support";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowUpRight,
@@ -92,6 +93,8 @@ async function api(url: string, method = "GET", data?: unknown) {
   return result;
 }
 async function upload(file: File, kind: string, conversationId?: string) {
+  if (file.size > 3 * 1024 * 1024)
+    throw new Error("画像・証明書は1ファイル3MB以内にしてください。");
   const form = new FormData();
   form.set("file", file);
   form.set("kind", kind);
@@ -507,6 +510,16 @@ export default function App() {
       />
     );
   else if (pathname === "/verify-email") content = <VerifyEmail ctx={ctx} />;
+  else if (pathname === "/contact" || pathname === "/support-admin")
+    content = ready ? (
+      <SupportPage
+        key={pathname + user?.id}
+        user={user}
+        admin={pathname === "/support-admin"}
+      />
+    ) : (
+      <Busy />
+    );
   else if (pathname === "/register")
     content = <Registration key={user?.id || "public"} ctx={ctx} />;
   else if (pathname === "/chat")
@@ -626,6 +639,7 @@ export default function App() {
             <Link href="/terms">利用規約</Link>
             <Link href="/privacy">プライバシー</Link>
             <Link href="/commerce">特定商取引法に基づく表記</Link>
+            <Link href="/contact">お問い合わせ</Link>
           </div>
         </div>
         <div className="footer-bottom">
@@ -1122,7 +1136,7 @@ function Home({ ctx }: { ctx: Context }) {
           {
             question: "利用料金はいくらですか？",
             answer:
-              "提供希望者の登録・利用は無料です。提供者は初回の登録審査と証明書の更新審査に、それぞれ税込5,000円がかかります。同時に複数の証明書を更新する場合は、一括で5,000円です。支払いを確認してから審査を開始します。登録後の定期的な利用料はありません。",
+              "提供希望者の登録・利用は無料です。提供者は初回の登録審査と証明書の更新審査に、それぞれ税込5,000円がかかります。同時更新は一括で5,000円です。原則は管理者による書類照合ですが、入金確認から30日経過した審査待ち・審査中の申請は自動承認・公開されます。差し戻し中・不承認・掲載停止・募集休止・退会済みは対象外です。共通表示の「登録審査完了」は、すべての書類の内容照合を保証する表示ではありません。定期利用料はありません。",
           },
           {
             question: "どの情報が公開されますか？",
@@ -1185,7 +1199,7 @@ function DonorCard({ donor: d }: { donor: Donor }) {
       <div className="card-tags">
         <span className="badge">
           <ShieldCheck size={12} />
-          本人確認済み
+          登録審査完了
         </span>
         {d.recentlyActive && <span className="subtle-tag">最近利用あり</span>}
       </div>
@@ -1580,7 +1594,7 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
           <div className="card-tags">
             <span className="badge">
               <ShieldCheck size={13} />
-              本人確認済み
+              登録審査完了
             </span>
             {d.recentlyActive && (
               <span className="subtle-tag">最近利用あり</span>
@@ -1590,6 +1604,9 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
             {d.displayId}
             <span>{d.age}歳</span>
           </h1>
+          <p className="muted">
+            所定の登録手続きを完了し、掲載されています。掲載情報には本人申告や換算による参考値を含みます。
+          </p>
           <p className="location">
             <MapPin size={15} />
             {d.residence}
@@ -2666,7 +2683,7 @@ function Registration({ ctx }: { ctx: Context }) {
                 <p>
                   {pending.status === "payment_pending"
                     ? "支払い完了後に審査を開始します。掲載の承認は保証されません。"
-                    : "支払いを確認しています。管理者の審査をお待ちください。"}
+                    : "入金確認済みです。原則は管理者が審査し、30日後に自動承認・公開します。差し戻し・不承認・休止・停止・退会は対象外です。"}
                 </p>
               </div>
               {pending.status === "payment_pending" && (
@@ -3295,7 +3312,7 @@ function Registration({ ctx }: { ctx: Context }) {
                         </strong>
                       </div>
                       <p>
-                        同時に提出する書類は一括料金です。支払い完了後に審査を開始します。不承認・自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。
+                        同時に提出する書類は一括料金です。支払い完了後に審査を開始します。入金確認から30日経過した審査待ち・審査中の申請は自動承認・公開します。差し戻し・不承認・休止・停止・退会は対象外です。不承認・自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。
                       </p>
                     </div>
                     <dl className="definition-list">
@@ -4076,6 +4093,9 @@ function AdminPage({ ctx }: { ctx: Context }) {
       <div className="page-heading">
         <span className="eyebrow">ADMINISTRATION</span>
         <h1>管理ページ</h1>
+        <Link href="/support-admin" className="button secondary">
+          問い合わせ管理
+        </Link>
         <p>書類を照合し、登録・証明書更新を判断します。</p>
       </div>
       <div className="admin-stats">
@@ -4265,6 +4285,36 @@ function AdminPage({ ctx }: { ctx: Context }) {
             </span>
           </div>
           <dl className="definition-list">
+            <div>
+              <dt>入金確認・承認</dt>
+              <dd>
+                {selected.paid_at || "未入金"} /{" "}
+                {selected.approval_method === "automatic"
+                  ? "期限経過による自動承認"
+                  : selected.approval_method === "manual"
+                    ? "管理者による承認"
+                    : "未承認"}
+                {selected.decided_at ? `（${selected.decided_at}）` : ""}
+              </dd>
+            </div>
+            <div>
+              <dt>審査通知</dt>
+              <dd>
+                {(
+                  {
+                    preview: "デモ受信欄（実送信なし）",
+                    queued: "送信待ち",
+                    sent: "送信済み",
+                    failed: "送信失敗・SMTP設定を確認してください",
+                  } as Record<string, string>
+                )[selected.reviewMail?.status] || "未作成"}
+                {selected.reviewMail?.status === "preview" && (
+                  <pre style={{ whiteSpace: "pre-wrap" }}>
+                    {selected.reviewMail.body}
+                  </pre>
+                )}
+              </dd>
+            </div>
             <div>
               <dt>生年月日</dt>
               <dd>{selected.birth_date}</dd>
@@ -4493,6 +4543,20 @@ function AdminPage({ ctx }: { ctx: Context }) {
   );
 }
 function LegalPage({ page }: { page: string }) {
+  const [operator, setOperator] = useState({
+    name: "",
+    address: "",
+    phone: "",
+    type: "individual",
+    representative: "",
+    mode: "on_request",
+    disclosureReady: false,
+  });
+  useEffect(() => {
+    api("public-config")
+      .then((result) => setOperator(result.operator))
+      .catch(() => {});
+  }, []);
   const title =
     page === "/terms"
       ? "利用規約"
@@ -4513,6 +4577,9 @@ function LegalPage({ page }: { page: string }) {
               日本国内向け、18歳以上の方が対象です。個人間の精子提供について情報を確認し、対話する場を提供します。運営による医療サービス・提供の実施・結果の保証はありません。
             </p>
             <h2>登録・審査料</h2>
+            <p>
+              原則は管理者による書類照合です。入金確認日時から30日を経過した審査待ち・審査中の申請は、期限経過により自動承認・公開されます。差し戻し中、不承認、掲載停止、募集休止、退会済みは対象外です。どちらの承認も「登録審査完了」と表示します。所定の登録手続きを完了し、掲載されています。掲載情報には本人申告や換算による参考値を含みます。この表示は、すべての書類の内容照合や情報の正確性を保証するものではありません。
+            </p>
             <p>
               希望者は無料。提供者の登録と証明書更新は、審査開始前に税込5,000円を支払います。同時更新は一括料金です。不承認や自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。二重決済やシステム起因の誤請求は運営が個別確認します。
             </p>
@@ -4552,6 +4619,9 @@ function LegalPage({ page }: { page: string }) {
             </p>
             <h2>削除と決済</h2>
             <p>
+              お問い合わせ内容と運営の返信は、受付・対応のためサイト内に保存し、本人と管理者が閲覧できます。ログインせずに送信した場合は専用リンクを知る人が閲覧できます。リンクと直近10件の受付履歴はこのブラウザーにも保存します。問い合わせ画面から削除できます。ログイン中に作成した問い合わせは退会時にも削除します。
+            </p>
+            <p>
               退会時にサイト本体の情報を削除します。バックアップを利用する公開環境では、その保存期限と削除手順を事前に案内します。決済事業者が保持する取引記録、利用者自身が取得・保存した情報は、サイト側から削除できません。
             </p>
             <h2>Cookie</h2>
@@ -4561,20 +4631,71 @@ function LegalPage({ page }: { page: string }) {
           </>
         ) : (
           <>
-            <div className="notice">
-              <AlertCircle size={21} />
-              <p>
-                運営者情報は未設定です。本番で受付を開始する前に、運営者と連絡先等を設定してください。
-              </p>
-            </div>
+            {(operator.mode === "on_request"
+              ? !operator.disclosureReady
+              : !operator.name || !operator.address || !operator.phone) && (
+              <div className="notice">
+                <AlertCircle size={21} />
+                <p>
+                  運営者情報は未設定です。本番で受付を開始する前に、運営者と連絡先等を設定してください。
+                </p>
+              </div>
+            )}
             <dl className="definition-list">
               <div>
                 <dt>サービス名</dt>
                 <dd>コウノトリのつばさ</dd>
               </div>
               <div>
-                <dt>運営者・住所・連絡先</dt>
-                <dd>公開前に設定</dd>
+                <dt>運営者</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? `請求時に開示（${operator.type === "company" ? "法人運営" : "個人運営"}）`
+                    : operator.name || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>運営責任者</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.representative ||
+                      operator.name ||
+                      "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>所在地</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.address || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>電話番号</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.phone || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>運営者情報の開示請求</dt>
+                <dd>
+                  {operator.disclosureReady
+                    ? "氏名・住所・電話番号は、請求があった場合、申込みの意思決定に先立って十分な時間的余裕をもって、書面または電子メール等で遅滞なく提供します。"
+                    : "開示のための情報と対応手順を準備中です。本番受付はまだ開始していません。"}{" "}
+                  <Link href="/contact">お問い合わせフォーム</Link>
+                  で「運営者情報の開示請求」を選択してください。
+                </dd>
+              </div>
+              <div>
+                <dt>お問い合わせ</dt>
+                <dd>
+                  <Link href="/contact">お問い合わせフォーム</Link>
+                  から受け付け、原則サイト内で返信します。
+                </dd>
               </div>
               <div>
                 <dt>販売価格</dt>

@@ -3804,3 +3804,74 @@ button a {
   font-size: 10px;
   font-weight: normal;
 }
+.support-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.support-page .panel {
+  margin-bottom: 24px;
+  min-width: 0;
+}
+.support-page input,
+.support-page textarea,
+.support-page select {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+.support-form,
+.support-main form {
+  display: grid;
+  gap: 16px;
+  margin: 16px 0;
+}
+.support-form label,
+.support-main form label {
+  display: grid;
+  gap: 8px;
+}
+.support-ticket {
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  width: 100%;
+  padding: 16px 8px;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  color: inherit;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.support-ticket[aria-pressed="true"] {
+  background: #edf3ed;
+}
+.support-ticket small {
+  color: var(--muted);
+}
+.support-message {
+  margin: 16px 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-wrap: anywhere;
+}
+.support-message time {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.support-message p {
+  white-space: pre-wrap;
+}
+.support-admin {
+  background: #f1f6f0;
+}
+@media (max-width: 760px) {
+  .support-layout {
+    grid-template-columns: 1fr;
+  }
+}

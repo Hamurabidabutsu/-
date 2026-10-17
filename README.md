@@ -1,6 +1,14 @@
 # コウノトリのつばさ
 
-日本国内・18歳以上向けの、個人間の精子提供について対話するための小規模サイト。Next.js / TypeScript / SQLiteで構成しています。外部DB、顔面・運動・健康の総合スコアは使いません。受信メール通知はSMTPで対応し、デモでは実送信せず受信欄で確認できます。
+公開先は **Netlify Free + PayPal** に確定しました。[Netlifyへの配置手順](docs/netlify-setup.md)と`deploy/netlify.env.example`を参照してください。GitHub連携、PostgreSQL、非公開Blobs、毎時の定期処理に対応。試験データは本番データから分離します。
+
+問い合わせフォーム `/contact` と管理者返信 `/support-admin` を追加しています。氏名・住所・電話番号は請求時開示を既定にし、公開APIに値を出しません。[本番公開の準備](docs/netlify-setup.md)と `deploy/production.env.example` を参照してください。
+
+2026年10月17日にエラーになったチャットから復元し、入金後の審査通知・30日後の自動公開・共通表記を追加しました。[引き継ぎ記録](docs/recovery-2026-10-17.md)を参照してください。
+
+審査通知先は `REVIEW_EMAIL` 環境変数へ設定します。通知は管理画面の申請詳細で確認できます。デモではメールを実送信しません。Netlifyでは常駐サーバーを使わず、毎時の予約処理と応答前のメール送信を使います。ローカル版では起動時と毎分の処理も維持しています。
+
+日本国内・18歳以上向けの、個人間の精子提供について対話するための小規模サイト。Next.js / TypeScript、NetlifyではPostgreSQLとBlobs、ローカルではSQLiteで構成。顔面・運動・健康の総合スコアは使いません。メール通知はSMTPで対応し、デモでは実送信せず受信欄で確認できます。
 
 ## Windowsでデモを試す
 
@@ -63,10 +71,11 @@ npm start
 | 変数 | 本番設定 |
 |---|---|
 | `APP_MODE` | `live`。デモログイン・架空データを停止 |
-| `DATA_DIR` | 永続ディスクの絶対パス。デモと別のフォルダー |
+| `STORAGE_BACKEND` | Netlifyでは `netlify`。ローカルは `sqlite`とDATA_DIRを指定 |
 | `SITE_URL` | 実際のHTTPSのサイトURL |
 | `PAYMENT_MODE` | `paypal` |
 | `PAYPAL_ENVIRONMENT` | まず `sandbox`、外部検証後に `live` |
+| `PAYPAL_WEBHOOK_ID` | 同じRESTアプリで作った署名検証用Webhook ID |
 | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | 対応するPayPalアプリの認証情報 |
 | `MAIL_MODE` | 本番は `smtp`。デモは `preview`（実送信なし） |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM` | SMTP接続先・送信者。465はTLS、587等のリモート接続はSTARTTLS必須。秘密値は安全に設定 |
@@ -77,7 +86,7 @@ npm start
 7. バックアップの有無、保存期間、退会者の削除対応を決める。この実装は自動バックアップを作りません。ホスティング事業者のスナップショットはアプリから削除できないため、保存期間とアクセス制限を設定する必要があります。決済事業者の記録もアプリの退会処理では削除できません。
 8. [構成・運用メモ](docs/architecture.md)を確認する。公開前の検索エンジン登録は無効です。運用情報を整えてから `src/app/layout.tsx` のrobots設定を変更してください。
 
-最低費用を優先し、外部DBを使わず、メールはSMTP提供元を選べる構成にしています。実際の費用は実行先・ドメイン・決済手数料によります。無料枠で永続ディスクが使えるかは実行先ごとに確認が必要です。
+Netlify版は公式のDBとBlobsを使い、無料枠上限で停止する構成です。メールはSMTP提供元を選べます。PayPal決済手数料はホスティング費と別です。
 
 ## 学歴データ
 
