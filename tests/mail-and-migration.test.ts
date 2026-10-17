@@ -36,20 +36,34 @@ async function serverAt(
           MAIL_FROM: "",
           ...extra,
         },
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
+  let output = "";
+  child.stdout?.on("data", (chunk) => {
+    output += chunk;
+  });
+  child.stderr?.on("data", (chunk) => {
+    output += chunk;
+  });
   for (let i = 0; i < 100; i++) {
     try {
-      if ((await fetch(origin + "/api/health")).ok) return { origin, child };
+      if (
+        (
+          await fetch(origin + "/api/health", {
+            signal: AbortSignal.timeout(500),
+          })
+        ).ok
+      )
+        return { origin, child };
     } catch {}
     await new Promise((r) => setTimeout(r, 100));
   }
   child.kill();
-  throw new Error("test server failed to start");
+  throw new Error("test server failed to start: " + output);
 }
 async function stop(child: ReturnType<typeof spawn>) {
-  if (child.exitCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>((resolve) => {
     child.once("exit", () => resolve());
     child.kill();
@@ -154,6 +168,7 @@ test("SMTP経由の確認・通知、未確認宛て/通知オフの抑止、本
     SMTP_USER: "",
     SMTP_PASSWORD: "",
     MAIL_FROM: "site@example.test",
+    REVIEW_EMAIL: "review@example.test",
   });
   try {
     const r = await signup(origin, "verified@example.test");
@@ -171,6 +186,41 @@ test("SMTP経由の確認・通知、未確認宛て/通知オフの抑止、本
       true,
     );
     const donor = await call(origin, "auth/demo", "POST", { role: "donor" });
+    const paymentDb = new DatabaseSync(path.join(directory, "site.sqlite"));
+    try {
+      paymentDb
+        .prepare(
+          "INSERT INTO applications(id,user_id,kind,data_json,status,paid,created_at) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          "smtp-review",
+          "demo_donor1",
+          "update",
+          JSON.stringify(emptyProfile()),
+          "payment_pending",
+          0,
+          new Date().toISOString(),
+        );
+      await call(origin, "payments/smtp-review/demo", "POST", {}, donor.cookie);
+      await eventually(() =>
+        received.some((m) => m.to === "review@example.test"),
+      );
+      await eventually(
+        () =>
+          paymentDb
+            .prepare(
+              "SELECT status FROM review_mail WHERE application_id='smtp-review'",
+            )
+            .get()?.status === "sent",
+      );
+      await call(origin, "payments/smtp-review/demo", "POST", {}, donor.cookie);
+      assert.equal(
+        received.filter((m) => m.to === "review@example.test").length,
+        1,
+      );
+    } finally {
+      paymentDb.close();
+    }
     const c = await call(
       origin,
       "conversations",
@@ -375,7 +425,7 @@ test("旧DBを移行して血圧を除き、一般筋肉量から率を捏造せ
     const migrated = new DatabaseSync(path.join(directory, "site.sqlite"));
     assert.equal(
       migrated.prepare("PRAGMA user_version").get()!.user_version,
-      2,
+      5,
     );
     migrated.close();
   } finally {

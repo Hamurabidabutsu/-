@@ -1,5 +1,6 @@
 node_modules/
 .next/
+.netlify/
 data/
 .env*
 !.env.example
@@ -10,3 +11,8 @@ test-results/
 .npm-cache/
 
 artifacts/*.zip
+
+# Private operational notes are retained in the local outputs, not public source.
+docs/account-setup.md
+docs/production-preparation.md
+docs/recovery-2026-10-17.md
