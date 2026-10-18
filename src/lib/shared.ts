@@ -114,6 +114,7 @@ export type Academic = {
   department: string;
   iq: number | null;
   deviation?: number | null;
+  submittedDeviation?: number | null;
   year?: number;
 };
 export type ProfileData = {
@@ -370,3 +371,4 @@ export function normalizeProfile(raw: Record<string, any>): ProfileData {
     raw;
   return { ...emptyProfile(), ...current };
 }
+

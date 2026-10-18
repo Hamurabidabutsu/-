@@ -2020,29 +2020,12 @@ function RegionEditor({
 function AcademicEditor({
   academic: a,
   onChange,
+  adminMode = false,
 }: {
   academic: Academic;
   onChange: (v: Academic) => void;
+  adminMode?: boolean;
 }) {
-  const [query, setQuery] = useState(""),
-    [entries, setEntries] = useState<any[]>([]);
-  useEffect(() => {
-    if (a.kind === "wais") return;
-    let active = true;
-    const timer = setTimeout(
-      () =>
-        api("catalog?kind=" + a.kind + "&q=" + encodeURIComponent(query))
-          .then((r) => {
-            if (active) setEntries(r.entries);
-          })
-          .catch(() => {}),
-      200,
-    );
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [query, a.kind]);
   if (a.kind === "wais")
     return (
       <Field
@@ -2065,47 +2048,15 @@ function AcademicEditor({
       </Field>
     );
   const manual = (field: string, v: string) =>
-    onChange({ ...a, [field]: v, catalogId: "", deviation: undefined });
+    onChange({
+      ...a,
+      [field]: v,
+      catalogId: "",
+      deviation: undefined,
+      submittedDeviation: a.submittedDeviation ?? a.deviation,
+    });
   return (
     <div className="academic-editor">
-      <Field
-        label="掲載データから学校・学科を検索"
-        note="現在掲載されている年度のデータを使用します。検索欄の文字は公開されません。"
-      >
-        <input
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="学校名・学科名で検索"
-        />
-      </Field>
-      {entries.length > 0 && (
-        <Field label="学校・学科を選択">
-          <select
-            value={a.catalogId}
-            onChange={(e) => {
-              const entry = entries.find((x) => x.id === e.target.value);
-              if (entry)
-                onChange({
-                  ...a,
-                  catalogId: entry.id,
-                  school: entry.school,
-                  faculty: entry.faculty,
-                  department: entry.department,
-                  deviation: entry.deviation,
-                  year: entry.year,
-                });
-            }}
-          >
-            <option value="">選択してください</option>
-            {entries.map((e) => (
-              <option key={e.id} value={e.id}>
-                {e.school} {e.faculty} {e.department}
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
       <div className="form-grid">
         <Field label="学校名" required>
           <input
@@ -2131,9 +2082,39 @@ function AcademicEditor({
             maxLength={120}
           />
         </Field>
+        <Field
+          label={adminMode ? "偏差値（確認済み）" : "偏差値（自己申告）"}
+          note={
+            adminMode
+              ? "確認した学校・学科の偏差値を入力してください。不明な場合は空欄にできます。"
+              : "分かる場合に入力してください。管理者が確認した値をIQの参考値に使用します。"
+          }
+        >
+          <input
+            type="number"
+            min={20}
+            max={90}
+            step="0.1"
+            value={
+              adminMode
+                ? (a.deviation ?? a.submittedDeviation ?? "")
+                : (a.submittedDeviation ?? a.deviation ?? "")
+            }
+            onChange={(e) => {
+              const value =
+                e.target.value === "" ? null : Number(e.target.value);
+              onChange({
+                ...a,
+                catalogId: "",
+                submittedDeviation: value,
+                deviation: adminMode ? value : undefined,
+              });
+            }}
+          />
+        </Field>
       </div>
       <p className="tiny muted">
-        一覧にない学校は、名称を指定して書類を提出できます。偏差値は管理者が指定サイトで照合します。卒業前・中退・海外校は対象外です。学校名は個別開示まで非公開です。
+        学校名・学部・学科は卒業証明書と同じ名称を入力してください。偏差値は管理者が照合します。卒業前・中退・海外校は対象外です。学校名は個別開示まで非公開です。
       </p>
     </div>
   );
@@ -3264,6 +3245,7 @@ function Registration({
                         </h4>
                         <AcademicEditor
                           academic={a}
+                          adminMode={adminMode}
                           onChange={(v) =>
                             set(
                               "academics",
@@ -3648,40 +3630,6 @@ function Registration({
                             onChange={(e) => setAdminNote(e.target.value)}
                           />
                         </Field>
-                        {p.academics.map(
-                          (a, i) =>
-                            a.kind !== "wais" &&
-                            !a.catalogId && (
-                              <Field
-                                key={a.kind}
-                                label={a.school + "：照合した偏差値（任意）"}
-                              >
-                                <input
-                                  type="number"
-                                  min={20}
-                                  max={90}
-                                  step="0.1"
-                                  value={a.deviation ?? ""}
-                                  onChange={(e) =>
-                                    set(
-                                      "academics",
-                                      p.academics.map((item, n) =>
-                                        n === i
-                                          ? {
-                                              ...item,
-                                              deviation:
-                                                e.target.value === ""
-                                                  ? null
-                                                  : Number(e.target.value),
-                                            }
-                                          : item,
-                                      ),
-                                    )
-                                  }
-                                />
-                              </Field>
-                            ),
-                        )}
                       </>
                     )}
                     <label className="check-row">
@@ -4426,10 +4374,12 @@ function AdminPage({ ctx }: { ctx: Context }) {
         confirmed,
         reason,
         academicDeviations: Object.fromEntries(
-          Object.entries(deviations).map(([k, v]) => [
-            k,
-            v === "" ? null : Number(v),
-          ]),
+          selected.profile.academics
+            .filter((a: Academic) => a.kind !== "wais")
+            .map((a: Academic) => {
+              const v = deviations[a.kind] ?? a.submittedDeviation;
+              return [a.kind, v === "" || v == null ? null : Number(v)];
+            }),
         ),
       });
       ctx.notify(
@@ -4783,7 +4733,7 @@ function AdminPage({ ctx }: { ctx: Context }) {
                   note={
                     a.deviation
                       ? "掲載データから取得済み。学校・学科の一致を確認してください。"
-                      : "現在掲載されている学科の最大値を照合。取得できない場合は空欄。"
+                      : `申告値：${a.submittedDeviation ?? "未入力"}。学校・学科の偏差値を照合し、必要なら修正してください。不明なら空欄。`
                   }
                 >
                   <input
@@ -4792,7 +4742,12 @@ function AdminPage({ ctx }: { ctx: Context }) {
                     min={20}
                     max={90}
                     disabled={!!a.deviation}
-                    value={a.deviation ?? deviations[a.kind] ?? ""}
+                    value={
+                      a.deviation ??
+                      deviations[a.kind] ??
+                      a.submittedDeviation ??
+                      ""
+                    }
                     onChange={(e) =>
                       setDeviations((old) => ({
                         ...old,

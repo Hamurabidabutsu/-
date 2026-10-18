@@ -867,6 +867,14 @@ async function profileData(
       };
       if (kind === "wais") r.iq = numeric(a.iq, 40, 200, "WAIS全検査IQ")!;
       else {
+        const submitted = numeric(
+          a.submittedDeviation,
+          20,
+          90,
+          "申告した偏差値",
+          true,
+        );
+        if (submitted !== null) r.submittedDeviation = submitted;
         const entry = a.catalogId
           ? await one(
               "SELECT * FROM catalog WHERE id=? AND kind=?",
@@ -906,6 +914,9 @@ async function profileData(
       if (
         r.kind !== "wais" &&
         trusted?.deviation !== undefined &&
+        (r.submittedDeviation === undefined ||
+          r.submittedDeviation === trusted.deviation ||
+          r.submittedDeviation === trusted.submittedDeviation) &&
         !r.deviation
       ) {
         r.deviation = trusted.deviation;
@@ -1740,11 +1751,14 @@ async function handleRequest(req: Request, parts: string[]) {
             a.kind !== "wais" &&
             !a.catalogId &&
             input &&
-            Object.hasOwn(input, "deviation")
+            (Object.hasOwn(input, "deviation") ||
+              Object.hasOwn(input, "submittedDeviation"))
           ) {
-            if (input.deviation === null) delete a.deviation;
-            else
-              a.deviation = numeric(input.deviation, 20, 90, "照合した偏差値")!;
+            const value = Object.hasOwn(input, "deviation")
+              ? input.deviation
+              : input.submittedDeviation;
+            if (value === null) delete a.deviation;
+            else a.deviation = numeric(value, 20, 90, "照合した偏差値")!;
           }
         }
         if (b.publish !== true) {

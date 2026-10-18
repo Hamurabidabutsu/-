@@ -46,12 +46,34 @@ export async function runWorkflow({
         faculty: "",
         department: "普通科",
         iq: null,
+        submittedDeviation: 62.5,
       },
     ],
     semenDate: "2026-10-01",
     semen: { volume: 3, motility: 65 },
   });
   await call("applications", "POST", { profile, fileIds: [] }, d.cookie, 400);
+  await call(
+    "profile",
+    "PATCH",
+    {
+      profile: {
+        ...profile,
+        academics: [{ ...profile.academics[0], submittedDeviation: 100 }],
+      },
+    },
+    d.cookie,
+    400,
+  );
+  await call("profile", "PATCH", { profile }, d.cookie);
+  const academicDraft = (await call("profile", "GET", undefined, d.cookie))
+    .profile.academics[0];
+  assert.equal(academicDraft.submittedDeviation, 62.5);
+  assert.equal(
+    academicDraft.deviation,
+    undefined,
+    "self-reported values are not confirmed values",
+  );
   await call(
     "profile",
     "PATCH",
@@ -168,6 +190,30 @@ export async function runWorkflow({
     assert.equal(await fileStatus(doc, admin.cookie), 404);
   let published = (await call("donors/" + d.user.id)).donor;
   assert.equal(published.iq, 130);
+  const confirmedProfile = (await call("profile", "GET", undefined, d.cookie))
+    .profile;
+  await call(
+    "profile",
+    "PATCH",
+    { profile: confirmedProfile, publish: true },
+    d.cookie,
+  );
+  await call(
+    "profile",
+    "PATCH",
+    {
+      profile: {
+        ...confirmedProfile,
+        academics: [
+          { ...confirmedProfile.academics[0], submittedDeviation: 89 },
+        ],
+      },
+      publish: true,
+    },
+    d.cookie,
+    409,
+  );
+  assert.equal((await call("donors/" + d.user.id)).donor.iq, 130);
   assert.equal(published.privateInfo, undefined);
   assert.equal(published.birthDate, undefined);
   assert.equal(published.email, undefined);
@@ -384,3 +430,4 @@ export async function runWorkflow({
   assert.equal(remaining[0].donor_id, undefined);
   await assertEmpty();
 }
+
