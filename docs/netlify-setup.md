@@ -23,7 +23,10 @@ Next.jsサイトをNetlify FreeとPayPalで運用するための配置手順。�
 - `SITE_URL`は公開URL。個人／法人、氏名／法人名、住所、電話、代表者、送信者、審査メール先は後で設定を変更できる。請求時開示の実体制も整える。
 - Gmailは既存アカウントを維持できる。`MAIL_MODE=smtp`とSMTP設定が必要。Gmailでは2段階認証とアプリパスワードを使う。実送信・到達は外部検証する。
 - PayPal DeveloperでまずSandboxのRESTアプリを作り、`PAYMENT_MODE=paypal`、`PAYPAL_ENVIRONMENT=sandbox`、`PAYPAL_CLIENT_ID`、`PAYPAL_CLIENT_SECRET`を設定。
-- 同じRESTアプリでWebhook URLを `https://…netlify.app/api/payments/webhook` とし、`PAYMENT.CAPTURE.COMPLETED`を購読。Webhook IDを`PAYPAL_WEBHOOK_ID`へ設定。
+- 同じRESTアプリでWebhook URLを `https://…netlify.app/api/payments/webhook` とし、`PAYMENT.CAPTURE.COMPLETED`（Payment capture completed）と`CHECKOUT.ORDER.APPROVED`（Checkout order approved）を購読。Webhook IDを`PAYPAL_WEBHOOK_ID`へ設定。
+- NetlifyのPrivateでは第三者のWebhookを受信できない。デモ管理者があるまま公開せず、本番モード・管理者・運営情報の設定を済ませてからproductionだけ公開し、通知受信を確認する。
+- 支払い前に申請番号をブラウザーのセッションへ保存し、戻り先URLのクエリーが失われても支払い結果を照会する。未承認・金額違いは売上確定せず、同じ申請への確定はPayPalの冪等キーで重複を防ぐ。
+- SMTP設定後は管理ページの「運営宛にテストメール」で到達を確認。宛先はADMIN_EMAIL（未指定ならREVIEW_EMAIL）のみ。デモでもこのボタンだけは実送信する。
 - Sandboxで支払い・サイトへの復帰・Webhook・審査通知・重複通知を確認。その後LiveのアプリとWebhookの値へ差し替え、`PAYPAL_ENVIRONMENT=live`にする。当該事業の受入可否確認は技術的な疎通確認とは別に残る。
 
 ## 保存と定期処理
@@ -52,3 +55,4 @@ Freeは月300 creditsのハード上限で自動追加購入なし。上限到�
 - [Scheduled Functions](https://docs.netlify.com/build/functions/scheduled-functions/)
 - [Freeの課金条件](https://docs.netlify.com/manage/accounts-and-billing/billing/billing-for-credit-based-plans/credit-based-pricing-plans/)
 - [PayPal Webhook](https://developer.paypal.com/api/webhooks/v1)
+

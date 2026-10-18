@@ -6,9 +6,10 @@ export const blobFetch: typeof fetch = async (input, init) => {
   // NETLIFY is a build variable and need not exist in a deployed function.
   const testing = process.env.NODE_ENV === "test" && !process.env.NETLIFY;
   const transport = testing ? globalThis.fetch : directFetch;
-  if (!testing) console.info("Blob transport: direct", init?.method || "GET");
-  const response = await (transport as typeof fetch)(input, { ...init, cache: "no-store" });
-  if (!testing) console.info("Blob transport: response", response.status);
+  const response = await (transport as typeof fetch)(input, {
+    ...init,
+    cache: "no-store",
+  });
   return response;
 };
 

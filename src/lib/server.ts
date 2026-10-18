@@ -20,7 +20,7 @@ import {
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import sharp from "sharp";
-import { mailMode, deliverMail } from "./mail";
+import { mailMode, deliverMail, sendTestMail } from "./mail";
 import {
   Academic,
   ProfileData,
@@ -267,7 +267,10 @@ async function markPaid(applicationId: string, reference: string) {
   });
 }
 async function queueReviewMail(applicationId: string) {
-  const recipient = process.env.REVIEW_EMAIL || process.env.ADMIN_EMAIL || (demo() ? "review@example.test" : "");
+  const recipient =
+    process.env.REVIEW_EMAIL ||
+    process.env.ADMIN_EMAIL ||
+    (demo() ? "review@example.test" : "");
   await run(
     "INSERT OR IGNORE INTO review_mail(application_id,recipient,subject,body,status) VALUES(?,?,?,?,?)",
     applicationId,
@@ -303,6 +306,7 @@ export async function processReviewDeadlines(timestamp = Date.now()) {
   await cleanFiles();
 }
 export async function startBackgroundWorkers() {
+  if (remoteStorage()) return;
   await initializeApp();
   if (!process.env.NETLIFY) await startMailWorker();
 }
@@ -1205,6 +1209,29 @@ export function verifiedCapture(data: Row, applicationId: string) {
     );
   return capture.id as string;
 }
+async function completePayPalOrder(app: Row) {
+  let order = await paypal("/v2/checkout/orders/" + app.paypal_order, "GET");
+  if (order.status !== "COMPLETED") {
+    if (order.status !== "APPROVED")
+      fail(409, "PayPalでの支払い承認がまだ完了していません。");
+    const units = order.purchase_units;
+    if (
+      !Array.isArray(units) ||
+      units.length !== 1 ||
+      units[0].custom_id !== app.id ||
+      units[0].amount?.currency_code !== "JPY" ||
+      Number(units[0].amount?.value) !== 5000
+    )
+      fail(409, "注文の金額または申請番号を確認できませんでした。");
+    order = await paypal(
+      "/v2/checkout/orders/" + app.paypal_order + "/capture",
+      "POST",
+      {},
+      app.id + "-capture",
+    );
+  }
+  return verifiedCapture(order, app.id);
+}
 async function handleRequest(req: Request, parts: string[]) {
   try {
     await initializeApp();
@@ -1241,9 +1268,12 @@ async function handleRequest(req: Request, parts: string[]) {
       );
       if (verified.verification_status !== "SUCCESS")
         fail(401, "署名を確認できませんでした。");
-      if (event.event_type !== "PAYMENT.CAPTURE.COMPLETED")
+      const approvedEvent = event.event_type === "CHECKOUT.ORDER.APPROVED";
+      if (!approvedEvent && event.event_type !== "PAYMENT.CAPTURE.COMPLETED")
         return json({ ok: true });
-      const orderId = event.resource?.supplementary_data?.related_ids?.order_id;
+      const orderId = approvedEvent
+        ? event.resource?.id
+        : event.resource?.supplementary_data?.related_ids?.order_id;
       if (typeof orderId !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(orderId))
         fail(400, "注文番号が不正です。");
       const app = await one(
@@ -1252,6 +1282,13 @@ async function handleRequest(req: Request, parts: string[]) {
       );
       // A deleted/withdrawn application must never be recreated by a late event.
       if (!app) return json({ ok: true });
+      if (approvedEvent) {
+        if (app.paid || app.status !== "payment_pending")
+          return json({ ok: true });
+        const reference = await completePayPalOrder(app);
+        await markPaid(app.id, reference);
+        return json({ ok: true });
+      }
       const order = await paypal("/v2/checkout/orders/" + orderId, "GET");
       const reference = verifiedCapture(order, app.id);
       if (reference !== event.resource?.id)
@@ -1267,6 +1304,20 @@ async function handleRequest(req: Request, parts: string[]) {
         req.headers.get("sec-fetch-site") === "cross-site"
       )
         fail(403, "別のサイトからの操作は受け付けられません。");
+    }
+    if (key === "admin/mail-test" && method === "POST") {
+      const admin = await needUser(req, "admin");
+      await rate("mail-test:" + admin.id, 3, 3600000);
+      const recipient =
+        process.env.ADMIN_EMAIL || process.env.REVIEW_EMAIL || "";
+      if (
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient) ||
+        !process.env.SMTP_HOST ||
+        !process.env.MAIL_FROM
+      )
+        fail(503, "メール設定と運営者の受信アドレスを先に設定してください。");
+      await sendTestMail(recipient);
+      return json({ ok: true });
     }
     if (key === "public-config" && method === "GET")
       return json({
@@ -1854,18 +1905,7 @@ async function handleRequest(req: Request, parts: string[]) {
       }
       if (parts[2] === "capture") {
         if (!app.paypal_order) fail(409, "先に決済手続きを開始してください。");
-        let order = await paypal(
-          "/v2/checkout/orders/" + app.paypal_order,
-          "GET",
-        );
-        if (order.status !== "COMPLETED")
-          order = await paypal(
-            "/v2/checkout/orders/" + app.paypal_order + "/capture",
-            "POST",
-            {},
-            app.id + "-capture",
-          );
-        const ref = verifiedCapture(order, app.id);
+        const ref = await completePayPalOrder(app);
         await markPaid(app.id, ref);
         return json({ paid: true });
       }
@@ -2571,8 +2611,6 @@ async function handleRequest(req: Request, parts: string[]) {
 
 export async function handle(req: Request, parts: string[]) {
   const mutation = !["GET", "HEAD"].includes(req.method);
-  const trace = parts.join("/") === "auth/demo";
-  if (trace) console.info("Demo login: maintenance reservation");
   if (mutation && remoteStorage()) {
     try {
       await wakeMaintenance();
@@ -2583,9 +2621,7 @@ export async function handle(req: Request, parts: string[]) {
       );
     }
   }
-  if (trace) console.info("Demo login: request processing");
   const response = await handleRequest(req, parts);
-  if (trace) console.info("Demo login: response", response.status);
   if (mutation && response.ok) {
     // Await delivery: serverless runtimes may freeze immediately after the response.
     try {
@@ -2625,3 +2661,4 @@ export async function nextMaintenanceTime(): Promise<number | null> {
     dates.push(Math.max(Number(garbage.at), Date.now() + 3600000));
   return dates.length ? Math.min(...dates) : null;
 }
+

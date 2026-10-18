@@ -189,13 +189,25 @@ test("Blobs bypass framework fetch in the Netlify runtime", async () => {
     globalThis.fetch = async () => {
       throw new Error("Framework fetch must not handle private blob requests");
     };
-    const store = getStore({ name: "transport-regression", consistency: "strong", fetch: blobFetch });
+    const store = getStore({
+      name: "transport-regression",
+      consistency: "strong",
+      fetch: blobFetch,
+    });
     assert.equal(await store.get("missing", { type: "json" }), null);
   } finally {
     globalThis.fetch = patchedFetch;
     if (previousRuntime === undefined) delete process.env.NETLIFY;
     else process.env.NETLIFY = previousRuntime;
   }
+});
+
+test("Only an administrator can send an operator mail test", async () => {
+  await call("admin/mail-test", "POST", {}, "", 401);
+  const recipient = await call("auth/demo", "POST", { role: "recipient" });
+  await call("admin/mail-test", "POST", {}, recipient.cookie, 403);
+  const admin = await call("auth/demo", "POST", { role: "admin" });
+  await call("admin/mail-test", "POST", { to: "untrusted@example.test" }, admin.cookie, 503);
 });
 
 test("PostgreSQL: parameter binding, transaction rollback and concurrent commits", async () => {
@@ -457,7 +469,9 @@ test("PayPal webhook: rejects forged signatures/amounts, verifies stored order, 
   let authentic = false,
     amount = "5000",
     verifications = 0,
-    reads = 0;
+    reads = 0,
+    captures = 0,
+    orderState = "COMPLETED";
   globalThis.fetch = async (input, init) => {
     const url = String(input instanceof Request ? input.url : input);
     if (!url.startsWith("https://api-m.sandbox.paypal.com/"))
@@ -476,13 +490,21 @@ test("PayPal webhook: rejects forged signatures/amounts, verifies stored order, 
         verification_status: authentic ? "SUCCESS" : "FAILURE",
       });
     }
-    assert.ok(url.endsWith("/v2/checkout/orders/" + orderId));
+    if (url.endsWith("/v2/checkout/orders/" + orderId + "/capture")) {
+      assert.equal(init?.method, "POST");
+      assert.equal(orderState, "APPROVED");
+      captures++;
+      orderState = "COMPLETED";
+    } else {
+      assert.ok(url.endsWith("/v2/checkout/orders/" + orderId));
+    }
     reads++;
     return Response.json({
-      status: "COMPLETED",
+      status: orderState,
       purchase_units: [
         {
           custom_id: appId,
+          amount: { currency_code: "JPY", value: amount },
           payments: {
             captures: [
               {
@@ -496,7 +518,7 @@ test("PayPal webhook: rejects forged signatures/amounts, verifies stored order, 
       ],
     });
   };
-  const event = {
+  const event: any = {
     event_type: "PAYMENT.CAPTURE.COMPLETED",
     resource: {
       id: captureId,
@@ -556,6 +578,40 @@ test("PayPal webhook: rejects forged signatures/amounts, verifies stored order, 
       1,
     );
     assert.equal(verifications, 4);
+
+    // An approved-order webhook completes payment even if the browser never returns.
+    await run(
+      "UPDATE applications SET paid=0,status='payment_pending',payment_ref=NULL,paid_at=NULL WHERE id=?",
+      appId,
+    );
+    await run("DELETE FROM review_mail WHERE application_id=?", appId);
+    event.event_type = "CHECKOUT.ORDER.APPROVED";
+    event.resource = { id: orderId };
+    orderState = "CREATED";
+    assert.equal((await webhook()).status, 409);
+    assert.equal(captures, 0);
+    orderState = "APPROVED";
+    amount = "4999";
+    assert.equal((await webhook()).status, 409);
+    assert.equal(captures, 0);
+    amount = "5000.00";
+    assert.equal((await webhook()).status, 200);
+    assert.equal(captures, 1);
+    assert.equal(
+      (await one("SELECT paid FROM applications WHERE id=?", appId))!.paid,
+      1,
+    );
+    assert.equal((await webhook()).status, 200);
+    assert.equal(captures, 1);
+    assert.equal(
+      Number(
+        (await one(
+          "SELECT COUNT(*) n FROM review_mail WHERE application_id=?",
+          appId,
+        ))!.n,
+      ),
+      1,
+    );
   } finally {
     globalThis.fetch = savedFetch;
     process.env.PAYMENT_MODE = "demo";
@@ -567,3 +623,4 @@ test("PayPal webhook: rejects forged signatures/amounts, verifies stored order, 
       delete process.env[key];
   }
 });
+

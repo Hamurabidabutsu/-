@@ -9,6 +9,20 @@ export function mailMode() {
 
 export async function deliverMail(to: string, subject: string, text: string) {
   if (mailMode() !== "smtp") throw new Error("SMTP未設定");
+  return sendSmtpMail(to, subject, text);
+}
+
+export async function sendTestMail(to: string) {
+  if (!process.env.SMTP_HOST || !process.env.MAIL_FROM)
+    throw new Error("SMTP未設定");
+  return sendSmtpMail(
+    to,
+    "コウノトリのつばさ：メール送信テスト",
+    "サイトからのテストメールです。このメールが届けば、送信設定は動作しています。会員情報や書類は含まれていません。",
+  );
+}
+
+async function sendSmtpMail(to: string, subject: string, text: string) {
   const host = process.env.SMTP_HOST!,
     port = Number(process.env.SMTP_PORT || 587);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
@@ -46,3 +60,4 @@ export async function deliverMail(to: string, subject: string, text: string) {
     transport.close();
   }
 }
+

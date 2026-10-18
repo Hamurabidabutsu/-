@@ -13,6 +13,7 @@ import {
 } from "react";
 import Link from "next/link";
 import SupportPage from "./Support";
+import { paymentReturnApplication } from "@/lib/payment-return";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowUpRight,
@@ -2434,17 +2435,26 @@ function Registration({ ctx }: { ctx: Context }) {
   }, [owner, load]);
   const captureOnce = useRef("");
   useEffect(() => {
-    const application = params.get("application");
-    if (
-      !owner ||
-      !application ||
-      !params.get("token") ||
-      captureOnce.current === application
-    )
+    if (!owner) return;
+    const marker = "kt_paypal_return:" + owner;
+    if (params.get("cancelled") === "1") {
+      try {
+        sessionStorage.removeItem(marker);
+      } catch {}
       return;
+    }
+    let saved = null;
+    try {
+      saved = sessionStorage.getItem(marker);
+    } catch {}
+    const application = paymentReturnApplication(params, saved);
+    if (!application || captureOnce.current === application) return;
     captureOnce.current = application;
     api("payments/" + application + "/capture", "POST", {})
       .then(() => {
+        try {
+          sessionStorage.removeItem(marker);
+        } catch {}
         ctx.notify("支払いを確認しました。審査待ちになりました。");
         void load(false);
       })
@@ -2514,8 +2524,12 @@ function Registration({ ctx }: { ctx: Context }) {
     setBusy(true);
     try {
       const r = await api("payments/" + a.id + "/" + action, "POST", {});
-      if (r.approveUrl) window.location.assign(r.approveUrl);
-      else {
+      if (r.approveUrl) {
+        try {
+          if (owner) sessionStorage.setItem("kt_paypal_return:" + owner, a.id);
+        } catch {}
+        window.location.assign(r.approveUrl);
+      } else {
         ctx.notify(
           ctx.paymentMode === "demo"
             ? "デモ支払いを確認しました。実際の課金はありません。"
@@ -4096,6 +4110,25 @@ function AdminPage({ ctx }: { ctx: Context }) {
         <Link href="/support-admin" className="button secondary">
           問い合わせ管理
         </Link>
+        <button
+          className="button secondary"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await api("admin/mail-test", "POST", {});
+              ctx.notify(
+                "運営者の受信アドレスへテストメールを送信しました。受信箱を確認してください。",
+              );
+            } catch (e) {
+              ctx.notify((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          運営宛にテストメール
+        </button>
         <p>書類を照合し、登録・証明書更新を判断します。</p>
       </div>
       <div className="admin-stats">
@@ -4732,3 +4765,4 @@ function LegalPage({ page }: { page: string }) {
     </div>
   );
 }
+

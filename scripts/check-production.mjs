@@ -1,5 +1,7 @@
 const required = [
   "SITE_URL",
+  "ADMIN_EMAIL",
+  "ADMIN_PASSWORD",
   "PAYPAL_CLIENT_ID",
   "PAYPAL_CLIENT_SECRET",
   "PAYPAL_WEBHOOK_ID",
@@ -14,6 +16,8 @@ const required = [
 ];
 const missing = required.filter((key) => !process.env[key]?.trim());
 const problems = [];
+if ((process.env.ADMIN_PASSWORD || "").length < 12)
+  problems.push("12文字以上の管理者パスワード（ADMIN_PASSWORD）");
 if (
   process.env.OPERATOR_TYPE === "company" &&
   !process.env.OPERATOR_REPRESENTATIVE?.trim()
@@ -47,3 +51,4 @@ if (missing.length || problems.length) {
   console.log(
     "必須設定の形式を確認しました。外部決済・メール到達・公開先での実動作と、運営者情報の正確性は別途確認が必要です。",
   );
+
