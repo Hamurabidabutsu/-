@@ -2571,6 +2571,8 @@ async function handleRequest(req: Request, parts: string[]) {
 
 export async function handle(req: Request, parts: string[]) {
   const mutation = !["GET", "HEAD"].includes(req.method);
+  const trace = parts.join("/") === "auth/demo";
+  if (trace) console.info("Demo login: maintenance reservation");
   if (mutation && remoteStorage()) {
     try {
       await wakeMaintenance();
@@ -2581,7 +2583,9 @@ export async function handle(req: Request, parts: string[]) {
       );
     }
   }
+  if (trace) console.info("Demo login: request processing");
   const response = await handleRequest(req, parts);
+  if (trace) console.info("Demo login: response", response.status);
   if (mutation && response.ok) {
     // Await delivery: serverless runtimes may freeze immediately after the response.
     try {

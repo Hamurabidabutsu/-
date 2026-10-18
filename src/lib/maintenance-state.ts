@@ -9,6 +9,12 @@ const stateStore = () =>
         ? "maintenance-state-demo"
         : "maintenance-state",
     consistency: "strong",
+    fetch: async (input, init) => {
+      const response = await fetch(input, init);
+      if (!response.ok && response.status !== 404)
+        console.warn("Maintenance storage HTTP", init?.method, response.status);
+      return response;
+    },
   });
 export async function maintenanceState() {
   if (!remoteStorage()) return null;
