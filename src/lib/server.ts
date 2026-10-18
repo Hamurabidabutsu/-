@@ -1,4 +1,5 @@
 import { wakeMaintenance } from "./maintenance-state";
+import { paypalConfiguration } from "./paypal-config";
 import {
   one,
   all,
@@ -1134,32 +1135,35 @@ let paypalToken:
   | {
       value: string;
       expires: number;
+      key: string;
     }
   | undefined;
-function paypalBase() {
-  return process.env.PAYPAL_ENVIRONMENT === "live"
-    ? "https://api-m.paypal.com"
-    : "https://api-m.sandbox.paypal.com";
-}
 async function paypal(
   pathname: string,
   method: string,
   payload?: unknown,
   requestId?: string,
 ) {
-  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET)
+  const settings = paypalConfiguration();
+  if (!settings.allowed) fail(503, "デモ環境では本番決済を利用できません。");
+  if (!settings.clientId || !settings.clientSecret)
     fail(503, "PayPalの接続設定が必要です。支払いは実行されていません。");
-  if (!paypalToken || paypalToken.expires < Date.now()) {
-    const res = await fetch(paypalBase() + "/v1/oauth2/token", {
+  const tokenKey = hash(
+    settings.baseURL + ":" + settings.clientId + ":" + settings.clientSecret,
+  );
+  if (
+    !paypalToken ||
+    paypalToken.key !== tokenKey ||
+    paypalToken.expires < Date.now()
+  ) {
+    const res = await fetch(settings.baseURL + "/v1/oauth2/token", {
       method: "POST",
       headers: {
         Authorization:
           "Basic " +
-          Buffer.from(
-            process.env.PAYPAL_CLIENT_ID +
-              ":" +
-              process.env.PAYPAL_CLIENT_SECRET,
-          ).toString("base64"),
+          Buffer.from(settings.clientId + ":" + settings.clientSecret).toString(
+            "base64",
+          ),
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: "grant_type=client_credentials",
@@ -1170,10 +1174,11 @@ async function paypal(
     const token = await res.json();
     paypalToken = {
       value: token.access_token,
+      key: tokenKey,
       expires: Date.now() + (Number(token.expires_in) - 60) * 1000,
     };
   }
-  const res = await fetch(paypalBase() + pathname, {
+  const res = await fetch(settings.baseURL + pathname, {
     method,
     headers: {
       Authorization: "Bearer " + paypalToken.value,
@@ -1240,7 +1245,7 @@ async function handleRequest(req: Request, parts: string[]) {
     if (key === "payments/webhook" && method === "POST") {
       if (
         process.env.PAYMENT_MODE !== "paypal" ||
-        !process.env.PAYPAL_WEBHOOK_ID
+        !paypalConfiguration().webhookId
       )
         fail(503, "PayPalのWebhook設定が必要です。");
       const event = await body(req);
@@ -1262,7 +1267,7 @@ async function handleRequest(req: Request, parts: string[]) {
         "POST",
         {
           ...headers,
-          webhook_id: process.env.PAYPAL_WEBHOOK_ID,
+          webhook_id: paypalConfiguration().webhookId,
           webhook_event: event,
         },
       );
@@ -1361,7 +1366,9 @@ async function handleRequest(req: Request, parts: string[]) {
         mode: demo() ? "demo" : "live",
         paymentMode: process.env.PAYMENT_MODE || "paypal",
         paypalConfigured: !!(
-          process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET
+          paypalConfiguration().allowed &&
+          paypalConfiguration().clientId &&
+          paypalConfiguration().clientSecret
         ),
       });
     if (key === "me" && method === "GET") {

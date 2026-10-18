@@ -27,7 +27,7 @@ Next.jsサイトをNetlify FreeとPayPalで運用するための配置手順。�
 - NetlifyのPrivateでは第三者のWebhookを受信できない。デモ管理者があるまま公開せず、本番モード・管理者・運営情報の設定を済ませてからproductionだけ公開し、通知受信を確認する。
 - 支払い前に申請番号をブラウザーのセッションへ保存し、戻り先URLのクエリーが失われても支払い結果を照会する。未承認・金額違いは売上確定せず、同じ申請への確定はPayPalの冪等キーで重複を防ぐ。
 - SMTP設定後は管理ページの「運営宛にテストメール」で到達を確認。宛先はADMIN_EMAIL（未指定ならREVIEW_EMAIL）のみ。デモでもこのボタンだけは実送信する。
-- Sandboxで支払い・サイトへの復帰・Webhook・審査通知・重複通知を確認。その後LiveのアプリとWebhookの値へ差し替え、`PAYPAL_ENVIRONMENT=live`にする。当該事業の受入可否確認は技術的な疎通確認とは別に残る。
+- Sandboxで支払い・サイトへの復帰・Webhook・審査通知・重複通知を確認。Liveアプリの値は別の`PAYPAL_LIVE_CLIENT_ID`、`PAYPAL_LIVE_CLIENT_SECRET`、`PAYPAL_LIVE_WEBHOOK_ID`へ保存し、Sandboxの3値は残す。公開準備が整ってから`APP_MODE=live`、`PAYPAL_ENVIRONMENT=live`へ切り替える。デモモードでは本番決済を拒否する。当該事業の受入可否確認は技術的な疎通確認とは別に残る。
 
 ## 保存と定期処理
 
