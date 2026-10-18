@@ -1,0 +1,39 @@
+-- Synthetic trial data is isolated from production tables.
+    CREATE TABLE IF NOT EXISTS demo_users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,birth_date TEXT NOT NULL,display_id TEXT NOT NULL,created_at TEXT NOT NULL,last_active TEXT NOT NULL,email_verified INTEGER NOT NULL DEFAULT 0,email_notifications INTEGER NOT NULL DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS demo_sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,expires_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_profiles(user_id TEXT PRIMARY KEY REFERENCES demo_users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'draft',data_json TEXT NOT NULL,approved_json TEXT,verified INTEGER NOT NULL DEFAULT 0,photo_id TEXT);
+    CREATE TABLE IF NOT EXISTS demo_applications(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,kind TEXT NOT NULL,data_json TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'payment_pending',paid INTEGER NOT NULL DEFAULT 0,payment_ref TEXT,paypal_order TEXT,created_at TEXT NOT NULL,review_started_at TEXT,review_reason TEXT,paid_at TEXT,decided_at TEXT,approval_method TEXT);
+    CREATE TABLE IF NOT EXISTS demo_conversations(id TEXT PRIMARY KEY,donor_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,recipient_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'requested',disclosed INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(donor_id,recipient_id));
+    CREATE TABLE IF NOT EXISTS demo_files(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,application_id TEXT REFERENCES demo_applications(id) ON DELETE CASCADE,conversation_id TEXT REFERENCES demo_conversations(id) ON DELETE CASCADE,kind TEXT NOT NULL,file_key TEXT NOT NULL,mime TEXT NOT NULL,original_name TEXT NOT NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES demo_conversations(id) ON DELETE CASCADE,sender_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,body TEXT NOT NULL,file_id TEXT REFERENCES demo_files(id) ON DELETE SET NULL,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_events(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES demo_conversations(id) ON DELETE CASCADE,donor_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,recipient_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,kind TEXT NOT NULL,occurred_on TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_chat_tombstones(id TEXT PRIMARY KEY,survivor_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_rate_limits(key TEXT PRIMARY KEY,hits INTEGER NOT NULL,expires_at BIGINT NOT NULL);
+    CREATE TABLE IF NOT EXISTS demo_file_gc(file_key TEXT PRIMARY KEY,not_before BIGINT NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS demo_catalog(id TEXT PRIMARY KEY,kind TEXT NOT NULL,school TEXT NOT NULL,faculty TEXT NOT NULL,department TEXT NOT NULL,deviation DOUBLE PRECISION NOT NULL,year INTEGER NOT NULL,source_url TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS demo_message_time ON demo_messages(conversation_id,created_at);
+    CREATE INDEX IF NOT EXISTS demo_file_owner ON demo_files(owner_id);
+    CREATE INDEX IF NOT EXISTS demo_applications_owner ON demo_applications(user_id,created_at);
+    
+CREATE TABLE IF NOT EXISTS demo_email_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,email TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS demo_mail_queue(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES demo_users(id) ON DELETE CASCADE,conversation_id TEXT REFERENCES demo_conversations(id) ON DELETE CASCADE,kind TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,next_attempt BIGINT NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS demo_review_mail(application_id TEXT PRIMARY KEY REFERENCES demo_applications(id) ON DELETE CASCADE,recipient TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt BIGINT NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS demo_support_tickets(id TEXT PRIMARY KEY,user_id TEXT REFERENCES demo_users(id) ON DELETE CASCADE,token_hash TEXT,category TEXT NOT NULL,subject TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS demo_support_messages(id TEXT PRIMARY KEY,ticket_id TEXT NOT NULL REFERENCES demo_support_tickets(id) ON DELETE CASCADE,sender TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS demo_support_owner ON demo_support_tickets(user_id,updated_at);
+CREATE INDEX IF NOT EXISTS demo_support_thread ON demo_support_messages(ticket_id,created_at);
+CREATE TABLE IF NOT EXISTS demo_reports(id TEXT PRIMARY KEY,conversation_id TEXT REFERENCES demo_conversations(id) ON DELETE CASCADE,user_id TEXT REFERENCES demo_users(id) ON DELETE CASCADE,reason TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS demo_service_leases(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL);
+
+INSERT INTO demo_catalog VALUES('f309dd465ee3112e4d156bc3','highschool','膳所高等学校','','理数科',76,2026,'https://www.minkou.jp/hischool/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('e13222080a14fbf67e00b1b2','highschool','神戸高等学校','','総合理学科',75,2026,'https://www.minkou.jp/hischool/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('6224b2294c4d78ff8378b63e','highschool','西大和学園高等学校','','普通科東大・京大・国公医コース',75,2026,'https://www.minkou.jp/hischool/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('d0a332817918bf5cf607c8c2','university','慶應義塾大学','医学部','医学科',72.5,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('86469de1d37d611ef92ee3d1','university','千葉大学','医学部','医学科',72.5,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('551c0e29bb9f342f71aa2fb1','university','一橋大学','ソーシャル・データサイエンス学部','ソーシャル・データサイエンス学科',72.5,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('e9c4741988f7ec076e5a94e5','university','一橋大学','経済学部','経済学科',72.5,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('7ce0fdd2dd3d436b7708e418','university','大阪大学','医学部','医学科',70,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('5af9331adc355b17dbb174c7','university','京都大学','医学部','医学科',70,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('2806495c2af79b9aa6a6ac2a','university','慶應義塾大学','環境情報学部','環境情報学科',70,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('f13b0d2cf87d284d24ed78f1','university','慶應義塾大学','総合政策学部','総合政策学科',70,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;
+INSERT INTO demo_catalog VALUES('6bb6da8dd8bbbe55d2b32616','university','国際教養大学','国際教養学部','国際教養学科',70,2027,'https://www.minkou.jp/university/ranking/deviation/') ON CONFLICT (id) DO NOTHING;

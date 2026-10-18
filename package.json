@@ -8,6 +8,7 @@
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
+    "production:check": "node --env-file-if-exists=.env.production.local scripts/check-production.mjs",
     "catalog:import": "node scripts/import-catalog.mjs",
     "format": "prettier --write src tests scripts next.config.ts",
     "demo": "node scripts/run-local-demo.mjs"
@@ -16,15 +17,20 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
+    "@netlify/blobs": "^11.1.4",
+    "@netlify/database": "^2.0.1",
     "cheerio": "^1.1.0",
     "lucide-react": "^0.468.0",
     "next": "^16.0.0",
     "nodemailer": "^10.0.16",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "sharp": "^0.35.5"
+    "sharp": "^0.35.5",
+    "undici": "^7.30.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17",
+    "@netlify/functions": "^6.0.2",
     "@types/node": "^24.0.0",
     "@types/nodemailer": "^8.0.2",
     "@types/react": "^19.2.0",

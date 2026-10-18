@@ -1,4 +1,16 @@
-import { DatabaseSync } from "node:sqlite";
+import { wakeMaintenance } from "./maintenance-state";
+import { paypalConfiguration } from "./paypal-config";
+import {
+  one,
+  all,
+  run,
+  transaction,
+  exec,
+  ensureStorage,
+  remoteStorage,
+  compactLocalDatabase,
+} from "./storage";
+import { putUpload, readUpload, deleteUpload } from "./uploads";
 import {
   randomBytes,
   randomUUID,
@@ -6,16 +18,10 @@ import {
   timingSafeEqual,
   createHash,
 } from "node:crypto";
-import {
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  existsSync,
-  unlinkSync,
-} from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import sharp from "sharp";
-import { mailMode, deliverMail } from "./mail";
+import { mailMode, deliverMail, sendTestMail } from "./mail";
 import {
   Academic,
   ProfileData,
@@ -42,7 +48,6 @@ import {
   ageAt,
   estimatedSkeletalMass,
 } from "./shared";
-
 type Row = Record<string, any>;
 const demo = () => process.env.APP_MODE === "demo";
 const dataDir = () =>
@@ -77,36 +82,37 @@ function passwordMatches(password: string, stored: string) {
     candidate.length === expected.length && timingSafeEqual(candidate, expected)
   );
 }
-let instance: DatabaseSync | undefined;
-function db() {
-  if (instance) return instance;
-  mkdirSync(path.join(dataDir(), "uploads"), { recursive: true, mode: 0o700 });
-  instance = new DatabaseSync(path.join(dataDir(), "site.sqlite"));
-  instance.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA busy_timeout=5000;
-    CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL,birth_date TEXT NOT NULL,display_id TEXT NOT NULL,created_at TEXT NOT NULL,last_active TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS profiles(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'draft',data_json TEXT NOT NULL,approved_json TEXT,verified INTEGER NOT NULL DEFAULT 0,photo_id TEXT);
-    CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,data_json TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'payment_pending',paid INTEGER NOT NULL DEFAULT 0,payment_ref TEXT,paypal_order TEXT,created_at TEXT NOT NULL,review_started_at TEXT,review_reason TEXT);
-    CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,donor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'requested',disclosed INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,UNIQUE(donor_id,recipient_id));
-    CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,application_id TEXT REFERENCES applications(id) ON DELETE CASCADE,conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,kind TEXT NOT NULL,file_key TEXT NOT NULL,mime TEXT NOT NULL,original_name TEXT NOT NULL,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,body TEXT NOT NULL,file_id TEXT REFERENCES files(id) ON DELETE SET NULL,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,donor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,kind TEXT NOT NULL,occurred_on TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS chat_tombstones(id TEXT PRIMARY KEY,survivor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,hits INTEGER NOT NULL,expires_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS file_gc(file_key TEXT PRIMARY KEY);
-    CREATE TABLE IF NOT EXISTS catalog(id TEXT PRIMARY KEY,kind TEXT NOT NULL,school TEXT NOT NULL,faculty TEXT NOT NULL,department TEXT NOT NULL,deviation REAL NOT NULL,year INTEGER NOT NULL,source_url TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS message_time ON messages(conversation_id,created_at);
-    CREATE INDEX IF NOT EXISTS file_owner ON files(owner_id);
-    CREATE INDEX IF NOT EXISTS applications_owner ON applications(user_id,created_at);
-    `);
-  migrate();
+let appReady: Promise<void> | undefined;
+async function initializeApp() {
+  if (!appReady)
+    appReady = initialize().catch((error) => {
+      appReady = undefined;
+      throw error;
+    });
+  return appReady;
+}
+async function initialize() {
+  await ensureStorage();
+  if (!remoteStorage()) {
+    await migrate();
+    await migrateReview();
+    await migrateSupport();
+    if (Number((await one("PRAGMA user_version"))?.user_version || 0) < 5) {
+      await exec(
+        "ALTER TABLE file_gc ADD COLUMN not_before BIGINT NOT NULL DEFAULT 0; PRAGMA user_version=5;",
+      );
+    }
+    await exec(
+      "CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,reason TEXT,created_at TEXT); CREATE TABLE IF NOT EXISTS service_leases(key TEXT PRIMARY KEY,expires_at BIGINT NOT NULL);",
+    );
+  }
   const catalogFile = path.join(process.cwd(), "catalog", "current.json");
-  if (existsSync(catalogFile)) {
+  if (!remoteStorage() && existsSync(catalogFile)) {
     const imported = JSON.parse(readFileSync(catalogFile, "utf8"));
-    transaction(() => {
-      run("DELETE FROM catalog");
+    await transaction(async () => {
+      await run("DELETE FROM catalog");
       for (const entry of imported.entries)
-        run(
+        await run(
           "INSERT INTO catalog VALUES(?,?,?,?,?,?,?,?)",
           entry.id,
           entry.kind,
@@ -119,50 +125,49 @@ function db() {
         );
     });
   }
-  if (demo() && !one("SELECT id FROM users LIMIT 1")) seedDemo();
-  if (
-    !demo() &&
-    !one("SELECT id FROM users WHERE role='admin' LIMIT 1") &&
-    process.env.ADMIN_EMAIL &&
-    process.env.ADMIN_PASSWORD
-  ) {
-    const email = process.env.ADMIN_EMAIL.toLowerCase().trim(),
-      password = process.env.ADMIN_PASSWORD;
-    if (password.length < 12)
-      throw new Error("ADMIN_PASSWORDは12文字以上に設定してください。");
-    run(
-      "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
-      id(),
-      email,
-      passwordHash(password),
-      "admin",
-      "1980-01-01",
-      "管理者",
-      now(),
-      now(),
-    );
-  }
-  cleanFiles();
-  startMailWorker();
-  return instance;
+  await transaction(async () => {
+    if (demo() && !(await one("SELECT id FROM users LIMIT 1")))
+      await seedDemo();
+    if (
+      !demo() &&
+      !(await one("SELECT id FROM users WHERE role='admin' LIMIT 1")) &&
+      process.env.ADMIN_EMAIL &&
+      process.env.ADMIN_PASSWORD
+    ) {
+      const email = process.env.ADMIN_EMAIL.toLowerCase().trim(),
+        password = process.env.ADMIN_PASSWORD;
+      if (password.length < 12)
+        throw new Error("ADMIN_PASSWORDは12文字以上に設定してください。");
+      await run(
+        "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
+        id(),
+        email,
+        passwordHash(password),
+        "admin",
+        "1980-01-01",
+        "管理者",
+        now(),
+        now(),
+      );
+    }
+  });
 }
-function migrate() {
-  const version = Number(one("PRAGMA user_version")?.user_version || 0);
+async function migrate() {
+  const version = Number((await one("PRAGMA user_version"))?.user_version || 0);
   if (version >= 2) return;
-  transaction(() => {
-    const columns = all("PRAGMA table_info(users)").map((x) => x.name);
+  await transaction(async () => {
+    const columns = (await all("PRAGMA table_info(users)")).map((x) => x.name);
     if (!columns.includes("email_verified"))
-      run(
+      await run(
         "ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0",
       );
     if (!columns.includes("email_notifications"))
-      run(
+      await run(
         "ALTER TABLE users ADD COLUMN email_notifications INTEGER NOT NULL DEFAULT 1",
       );
-    db()
-      .exec(`CREATE TABLE IF NOT EXISTS email_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,email TEXT NOT NULL,expires_at TEXT NOT NULL);
+    await exec(`CREATE TABLE IF NOT EXISTS email_tokens(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,email TEXT NOT NULL,expires_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mail_queue(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,kind TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);`);
-    for (const row of all("SELECT * FROM profiles")) {
+    for (const row of await all("SELECT * FROM profiles")) {
       const normalize = (json: string | null) => {
         if (!json) return null;
         const raw = JSON.parse(json),
@@ -176,87 +181,227 @@ function migrate() {
           ];
         return JSON.stringify(p);
       };
-      run(
+      await run(
         "UPDATE profiles SET data_json=?,approved_json=? WHERE user_id=?",
         normalize(row.data_json),
         normalize(row.approved_json),
         row.user_id,
       );
     }
-    for (const row of all("SELECT id,data_json FROM applications"))
-      run(
+    for (const row of await all("SELECT id,data_json FROM applications"))
+      await run(
         "UPDATE applications SET data_json=? WHERE id=?",
         JSON.stringify(normalizeProfile(JSON.parse(row.data_json))),
         row.id,
       );
-    run(
+    await run(
       "UPDATE users SET email_verified=1 WHERE id LIKE 'demo_%' AND email LIKE '%@example.test'",
     );
-    db().exec("PRAGMA user_version=2");
+    await exec("PRAGMA user_version=2");
   });
 }
-let mailFlushing = false;
-async function flushMail() {
-  if (mailFlushing || mailMode() !== "smtp") return;
-  mailFlushing = true;
-  try {
-    for (let batch = 0; batch < 4; batch++) {
-      const pending = all(
-        "SELECT * FROM mail_queue WHERE status='queued' AND next_attempt<=? ORDER BY created_at LIMIT 30",
-        Date.now(),
+async function migrateReview() {
+  if (Number((await one("PRAGMA user_version"))?.user_version || 0) >= 3)
+    return;
+  await transaction(async () => {
+    await exec(`ALTER TABLE applications ADD COLUMN paid_at TEXT;
+      ALTER TABLE applications ADD COLUMN decided_at TEXT;
+      ALTER TABLE applications ADD COLUMN approval_method TEXT;
+      CREATE TABLE review_mail(application_id TEXT PRIMARY KEY REFERENCES applications(id) ON DELETE CASCADE,recipient TEXT NOT NULL,subject TEXT NOT NULL,body TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt INTEGER NOT NULL DEFAULT 0);
+      PRAGMA user_version=3;`);
+    // Old paid records lack a trustworthy payment time. Give them a full grace period.
+    await run(
+      "UPDATE applications SET paid_at=? WHERE paid=1 AND status IN ('queued','reviewing','needs_changes')",
+      now(),
+    );
+  });
+}
+async function migrateSupport() {
+  if (Number((await one("PRAGMA user_version"))?.user_version || 0) >= 4)
+    return;
+  await transaction(async () => {
+    await exec(`CREATE TABLE support_tickets(id TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,token_hash TEXT,category TEXT NOT NULL,subject TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+      CREATE TABLE support_messages(id TEXT PRIMARY KEY,ticket_id TEXT NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,sender TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
+      CREATE INDEX support_owner ON support_tickets(user_id,updated_at);
+      CREATE INDEX support_thread ON support_messages(ticket_id,created_at);
+      PRAGMA user_version=4;`);
+  });
+}
+async function supportAccess(req: Request, ticketId: string) {
+  const ticket = await one(
+    "SELECT * FROM support_tickets WHERE id=?",
+    ticketId,
+  );
+  if (!ticket) fail(404, "問い合わせが見つかりません。");
+  const user = await sessionUser(req);
+  const token = req.headers.get("x-support-token") || "";
+  if (
+    user?.role !== "admin" &&
+    !(ticket.user_id && ticket.user_id === user?.id) &&
+    !(
+      !ticket.user_id &&
+      token.length <= 200 &&
+      ticket.token_hash === hash(token)
+    )
+  )
+    fail(404, "問い合わせが見つかりません。");
+  return { ticket, user };
+}
+function supportSummary(ticket: Row) {
+  const { token_hash, user_id, ...summary } = ticket;
+  return summary;
+}
+function supportText(value: unknown, limit: number, label: string) {
+  if (typeof value !== "string" || !value.trim() || value.trim().length > limit)
+    fail(400, `${label}は1〜${limit}文字で入力してください。`);
+  return value.trim();
+}
+async function markPaid(applicationId: string, reference: string) {
+  await transaction(async () => {
+    const changed = await run(
+      "UPDATE applications SET paid=1,status='queued',payment_ref=?,paid_at=? WHERE id=? AND paid=0 AND status='payment_pending'",
+      reference,
+      now(),
+      applicationId,
+    );
+    if (changed.changes) await queueReviewMail(applicationId);
+  });
+}
+async function queueReviewMail(applicationId: string) {
+  const recipient =
+    process.env.REVIEW_EMAIL ||
+    process.env.ADMIN_EMAIL ||
+    (demo() ? "review@example.test" : "");
+  await run(
+    "INSERT OR IGNORE INTO review_mail(application_id,recipient,subject,body,status) VALUES(?,?,?,?,?)",
+    applicationId,
+    recipient,
+    "コウノトリのつばさ：入金確認・審査のお願い",
+    `申請番号：${applicationId}\n入金を確認しました。ログインして審査してください。\n${siteUrl()}/admin\n入金確認から30日で登録審査完了として自動公開されます。`,
+    !recipient ? "failed" : mailMode() === "preview" ? "preview" : "queued",
+  );
+}
+export async function processReviewDeadlines(timestamp = Date.now()) {
+  await initializeApp();
+  const cutoff = new Date(timestamp - 30 * 86400000).toISOString();
+  await transaction(async () => {
+    for (const app of await all(
+      "SELECT a.*,p.status AS profile_status FROM applications a JOIN profiles p ON p.user_id=a.user_id WHERE a.paid=1 AND a.paid_at<=? AND a.status IN ('queued','reviewing') AND p.status NOT IN ('suspended','paused') LIMIT 20",
+      cutoff,
+    )) {
+      const p = normalizeProfile(JSON.parse(app.data_json));
+      await run(
+        "UPDATE profiles SET data_json=?,approved_json=?,status='approved' WHERE user_id=?",
+        JSON.stringify(p),
+        JSON.stringify(p),
+        app.user_id,
       );
-      if (!pending.length) break;
-      for (const item of pending) {
-        const user = one("SELECT * FROM users WHERE id=?", item.user_id);
-        const chat = item.conversation_id
-          ? one(
-              "SELECT status FROM conversations WHERE id=?",
-              item.conversation_id,
-            )
-          : null;
-        if (
-          !user ||
-          (item.kind !== "verify" &&
-            (!user.email_verified ||
-              !user.email_notifications ||
-              !chat ||
-              !["accepted", "requested"].includes(chat.status)))
-        ) {
-          run("DELETE FROM mail_queue WHERE id=?", item.id);
-          continue;
-        }
-        if (
-          item.kind === "verify" &&
-          !one(
+      await run(
+        "UPDATE applications SET status='approved',approval_method='automatic',decided_at=? WHERE id=?",
+        new Date(timestamp).toISOString(),
+        app.id,
+      );
+      await deleteDocuments(app.id);
+    }
+  });
+  await cleanFiles();
+}
+export async function startBackgroundWorkers() {
+  if (remoteStorage()) return;
+  await initializeApp();
+  if (!process.env.NETLIFY) await startMailWorker();
+}
+async function flushMail(limit = 3, budgetMs = 12000) {
+  if (mailMode() !== "smtp") return;
+  const stamp = Date.now() + 90000;
+  const lease = await one(
+    "INSERT INTO service_leases(key,expires_at) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET expires_at=excluded.expires_at WHERE service_leases.expires_at<=? RETURNING key",
+    "mail",
+    stamp,
+    Date.now(),
+  );
+  if (!lease) return;
+  const until = Date.now() + budgetMs;
+  let sent = 0;
+  try {
+    const review = await all(
+      "SELECT * FROM review_mail WHERE status='queued' AND next_attempt<=? LIMIT 3",
+      Date.now(),
+    );
+    for (const item of review) {
+      if (sent >= limit || Date.now() >= until) break;
+      sent++;
+      try {
+        await deliverMail(item.recipient, item.subject, item.body);
+        await run(
+          "UPDATE review_mail SET status='sent' WHERE application_id=?",
+          item.application_id,
+        );
+      } catch {
+        const attempts = item.attempts + 1;
+        await run(
+          "UPDATE review_mail SET attempts=?,next_attempt=?,status=? WHERE application_id=?",
+          attempts,
+          Date.now() + Math.min(3600000, 60000 * 2 ** attempts),
+          attempts >= 5 ? "failed" : "queued",
+          item.application_id,
+        );
+      }
+    }
+    for (const item of await all(
+      "SELECT * FROM mail_queue WHERE status='queued' AND next_attempt<=? ORDER BY created_at LIMIT 10",
+      Date.now(),
+    )) {
+      if (sent >= limit || Date.now() >= until) break;
+      const user = await one("SELECT * FROM users WHERE id=?", item.user_id);
+      const chat = item.conversation_id
+        ? await one(
+            "SELECT status FROM conversations WHERE id=?",
+            item.conversation_id,
+          )
+        : null;
+      if (
+        !user ||
+        (item.kind !== "verify" &&
+          (!user.email_verified ||
+            !user.email_notifications ||
+            !chat ||
+            !["accepted", "requested"].includes(chat.status))) ||
+        (item.kind === "verify" &&
+          !(await one(
             "SELECT token_hash FROM email_tokens WHERE user_id=? AND email=? AND expires_at>?",
             user.id,
             user.email,
             now(),
-          )
-        ) {
-          run("DELETE FROM mail_queue WHERE id=?", item.id);
-          continue;
-        }
-        try {
-          await deliverMail(user.email, item.subject, item.body);
-          run("DELETE FROM mail_queue WHERE id=?", item.id);
-        } catch {
-          const attempts = item.attempts + 1;
-          run(
-            "UPDATE mail_queue SET attempts=?,next_attempt=?,status=? WHERE id=?",
-            attempts,
-            Date.now() + Math.min(3600000, 60000 * 2 ** attempts),
-            attempts >= 5 ? "failed" : "queued",
-            item.id,
-          );
-        }
+          )))
+      ) {
+        await run("DELETE FROM mail_queue WHERE id=?", item.id);
+        continue;
+      }
+      sent++;
+      try {
+        await deliverMail(user.email, item.subject, item.body);
+        await run("DELETE FROM mail_queue WHERE id=?", item.id);
+      } catch {
+        const attempts = item.attempts + 1;
+        await run(
+          "UPDATE mail_queue SET attempts=?,next_attempt=?,status=? WHERE id=?",
+          attempts,
+          Date.now() + Math.min(3600000, 60000 * 2 ** attempts),
+          attempts >= 5 ? "failed" : "queued",
+          item.id,
+        );
       }
     }
   } finally {
-    mailFlushing = false;
+    await run(
+      "DELETE FROM service_leases WHERE key=? AND expires_at=?",
+      "mail",
+      stamp,
+    );
   }
 }
-function enqueueMail(
+async function enqueueMail(
   uid: string,
   kind: string,
   subject: string,
@@ -264,13 +409,13 @@ function enqueueMail(
   conversationId: string | null = null,
 ) {
   if (mailMode() === "unconfigured") return;
-  const user = one("SELECT * FROM users WHERE id=?", uid);
+  const user = await one("SELECT * FROM users WHERE id=?", uid);
   if (
     !user ||
     (kind !== "verify" && (!user.email_verified || !user.email_notifications))
   )
     return;
-  run(
+  await run(
     "INSERT INTO mail_queue(id,user_id,conversation_id,kind,subject,body,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
     id(),
     uid,
@@ -281,24 +426,26 @@ function enqueueMail(
     mailMode() === "preview" ? "preview" : "queued",
     now(),
   );
-  void flushMail();
 }
-function verifyEmail(user: Row) {
+async function verifyEmail(user: Row) {
   if (mailMode() === "unconfigured")
     fail(503, "メール送信が未設定です。運営者にお問い合わせください。");
-  rate("verify-email:" + user.id, 3, 3600000);
+  await rate("verify-email:" + user.id, 3, 3600000);
   const token = randomBytes(32).toString("hex");
-  transaction(() => {
-    run("DELETE FROM email_tokens WHERE user_id=?", user.id);
-    run("DELETE FROM mail_queue WHERE user_id=? AND kind='verify'", user.id);
-    run(
+  await transaction(async () => {
+    await run("DELETE FROM email_tokens WHERE user_id=?", user.id);
+    await run(
+      "DELETE FROM mail_queue WHERE user_id=? AND kind='verify'",
+      user.id,
+    );
+    await run(
       "INSERT INTO email_tokens VALUES(?,?,?,?)",
       hash(token),
       user.id,
       user.email,
       new Date(Date.now() + 86400000).toISOString(),
     );
-    enqueueMail(
+    await enqueueMail(
       user.id,
       "verify",
       "コウノトリのつばさ：メールアドレスの確認",
@@ -309,14 +456,14 @@ function verifyEmail(user: Row) {
 function siteUrl() {
   return (process.env.SITE_URL || "").replace(/\/$/, "");
 }
-function chatMail(uid: string, cid: string, kind: string) {
+async function chatMail(uid: string, cid: string, kind: string) {
   const label =
     kind === "request"
       ? "会話の申請が届きました"
       : kind === "accept"
         ? "会話の申請が承認されました"
         : "新しいメッセージが届きました";
-  enqueueMail(
+  await enqueueMail(
     uid,
     kind,
     `コウノトリのつばさ：${label}`,
@@ -325,61 +472,51 @@ function chatMail(uid: string, cid: string, kind: string) {
   );
 }
 let mailTimer: ReturnType<typeof setInterval> | undefined;
-function startMailWorker() {
-  if (mailTimer || mailMode() !== "smtp") return;
-  mailTimer = setInterval(() => {
-    void flushMail();
+async function startMailWorker() {
+  if (mailTimer || process.env.NETLIFY) return;
+  mailTimer = setInterval(async () => {
+    try {
+      await processReviewDeadlines();
+    } catch {
+      console.error("登録審査の期限処理に失敗しました。次回再試行します。");
+    }
+    await flushMail().catch(() =>
+      console.error("メール処理に失敗しました。次回再試行します。"),
+    );
   }, 60000);
   mailTimer.unref();
-  void flushMail();
+  // Recover overdue applications and missed notifications after a restart.
+  for (const app of await all(
+    "SELECT id FROM applications WHERE paid=1 AND status IN ('queued','reviewing','needs_changes')",
+  ))
+    await queueReviewMail(app.id);
+  await processReviewDeadlines();
 }
-
-function one(sql: string, ...params: any[]): Row | undefined {
-  return db()
-    .prepare(sql)
-    .get(...params) as Row | undefined;
-}
-function all(sql: string, ...params: any[]): Row[] {
-  return db()
-    .prepare(sql)
-    .all(...params) as Row[];
-}
-function run(sql: string, ...params: any[]) {
-  return db()
-    .prepare(sql)
-    .run(...params);
-}
-function transaction<T>(fn: () => T): T {
-  db().exec("BEGIN IMMEDIATE");
-  try {
-    const result = fn();
-    db().exec("COMMIT");
-    return result;
-  } catch (error) {
-    db().exec("ROLLBACK");
-    throw error;
-  }
-}
-function cleanFiles() {
-  for (const file of all("SELECT file_key FROM file_gc")) {
+async function cleanFiles() {
+  for (const file of await all(
+    "SELECT file_key FROM file_gc WHERE not_before<=? LIMIT 50",
+    Date.now(),
+  )) {
     try {
-      const p = path.join(dataDir(), "uploads", file.file_key);
-      if (existsSync(p)) unlinkSync(p);
-      run("DELETE FROM file_gc WHERE file_key=?", file.file_key);
+      await deleteUpload(file.file_key);
+      await run("DELETE FROM file_gc WHERE file_key=?", file.file_key);
     } catch {
       /* Keep only the random storage key for a retry; never expose the file. */
     }
   }
 }
-function deleteDocuments(applicationId: string) {
-  for (const file of all(
+async function deleteDocuments(applicationId: string) {
+  for (const file of await all(
     "SELECT file_key FROM files WHERE application_id=?",
     applicationId,
   ))
-    run("INSERT OR IGNORE INTO file_gc VALUES(?)", file.file_key);
-  run("DELETE FROM files WHERE application_id=?", applicationId);
+    await run(
+      "INSERT OR IGNORE INTO file_gc(file_key) VALUES(?)",
+      file.file_key,
+    );
+  await run("DELETE FROM files WHERE application_id=?", applicationId);
 }
-function seedDemo() {
+async function seedDemo() {
   const users = [
     ["demo_admin", "admin@example.test", "admin", "1980-01-01", "管理者"],
     [
@@ -394,7 +531,7 @@ function seedDemo() {
     ["demo_donor3", "donor3@example.test", "donor", "1996-11-08", "D-0003"],
   ];
   for (const u of users)
-    run(
+    await run(
       "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
       u[0],
       u[1],
@@ -405,7 +542,7 @@ function seedDemo() {
       now(),
       now(),
     );
-  run("UPDATE users SET email_verified=1 WHERE id LIKE 'demo_%'");
+  await run("UPDATE users SET email_verified=1 WHERE id LIKE 'demo_%'");
   const date = now().slice(0, 10);
   for (let i = 1; i <= 3; i++) {
     const p = emptyProfile();
@@ -437,7 +574,6 @@ function seedDemo() {
       infections: Object.fromEntries(
         INFECTIONS.map((x) => [x, i === 3 ? "未検査・未提出" : "陰性"]),
       ),
-
       smoking: "吸わない",
       drinking: "週2日",
       exercise: "週3日",
@@ -468,7 +604,7 @@ function seedDemo() {
             { prefecture: "埼玉県", area: "全域" },
             { prefecture: "千葉県", area: "中心部" },
           ];
-    run(
+    await run(
       "INSERT INTO profiles VALUES(?,?,?,?,?,NULL)",
       "demo_donor" + i,
       "approved",
@@ -499,7 +635,7 @@ function publicUser(row: Row): User {
     emailNotifications: !!row.email_notifications,
   };
 }
-function sessionUser(req: Request) {
+async function sessionUser(req: Request) {
   const token = req.headers
     .get("cookie")
     ?.split(";")
@@ -507,16 +643,17 @@ function sessionUser(req: Request) {
     .find((s) => s.startsWith("kt_session="))
     ?.slice(11);
   if (!token || token.length > 200) return undefined;
-  const row = one(
+  const row = await one(
     "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?",
     hash(token),
     now(),
   );
-  if (row) run("UPDATE users SET last_active=? WHERE id=?", now(), row.id);
+  if (row)
+    await run("UPDATE users SET last_active=? WHERE id=?", now(), row.id);
   return row;
 }
-function needUser(req: Request, role?: Role) {
-  const user = sessionUser(req);
+async function needUser(req: Request, role?: Role) {
+  const user = await sessionUser(req);
   if (!user) fail(401, "ログインしてください。");
   if (role && user.role !== role) fail(403, "この操作を行う権限がありません。");
   return user;
@@ -529,9 +666,9 @@ function sessionCookie(
   const secure = new URL(process.env.SITE_URL || req.url).protocol === "https:";
   return `kt_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
 }
-function loginResponse(user: Row, req: Request) {
+async function loginResponse(user: Row, req: Request) {
   const token = randomBytes(32).toString("base64url");
-  run(
+  await run(
     "INSERT INTO sessions VALUES(?,?,?)",
     hash(token),
     user.id,
@@ -541,22 +678,18 @@ function loginResponse(user: Row, req: Request) {
     "Set-Cookie": sessionCookie(token, req),
   });
 }
-function rate(key: string, limit: number, windowMs: number) {
-  const time = Date.now(),
-    k = hash(key),
-    r = one("SELECT * FROM rate_limits WHERE key=?", k);
-  if (!r || r.expires_at < time)
-    run(
-      "INSERT OR REPLACE INTO rate_limits VALUES(?,?,?)",
-      k,
-      1,
-      time + windowMs,
-    );
-  else {
-    if (r.hits >= limit)
-      fail(429, "試行回数が多いため、しばらく待ってからお試しください。");
-    run("UPDATE rate_limits SET hits=hits+1 WHERE key=?", k);
-  }
+async function rate(key: string, limit: number, windowMs: number) {
+  const time = Date.now();
+  const row = await one(
+    "INSERT INTO rate_limits(key,hits,expires_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET hits=CASE WHEN rate_limits.expires_at<? THEN 1 ELSE rate_limits.hits+1 END,expires_at=CASE WHEN rate_limits.expires_at<? THEN excluded.expires_at ELSE rate_limits.expires_at END RETURNING hits",
+    hash(key),
+    1,
+    time + windowMs,
+    time,
+    time,
+  );
+  if (Number(row!.hits) > limit)
+    fail(429, "試行回数が多いため、しばらく待ってからお試しください。");
 }
 async function bounded(req: Request, max: number) {
   if (Number(req.headers.get("content-length") || 0) > max)
@@ -648,11 +781,11 @@ function regions(value: any) {
     return r;
   });
 }
-function profileData(
+async function profileData(
   input: Row,
   previous: ProfileData | undefined,
   birthDate: string,
-): ProfileData {
+): Promise<ProfileData> {
   const p = emptyProfile();
   for (const [key, min, max, label] of [
     ["height", 100, 250, "身長"],
@@ -715,62 +848,83 @@ function profileData(
   )
     fail(400, "高校・大学の卒業証明またはWAISのうち、最低1つが必要です。");
   const kinds = new Set();
-  p.academics = input.academics.map((a: Row) => {
-    const kind = choice(
-      a.kind,
-      ["highschool", "university", "wais"],
-      "学歴・検査",
-    ) as Academic["kind"];
-    if (kinds.has(kind)) fail(400, "同じ種類の学歴・検査は1つまでです。");
-    kinds.add(kind);
-    const r: Academic = {
-      kind,
-      catalogId: "",
-      school: "",
-      faculty: "",
-      department: "",
-      iq: null,
-    };
-    if (kind === "wais") r.iq = numeric(a.iq, 40, 200, "WAIS全検査IQ")!;
-    else {
-      const entry = a.catalogId
-        ? one(
-            "SELECT * FROM catalog WHERE id=? AND kind=?",
-            text(a.catalogId),
-            kind,
+  p.academics = await Promise.all(
+    input.academics.map(async (a: Row) => {
+      const kind = choice(
+        a.kind,
+        ["highschool", "university", "wais"],
+        "学歴・検査",
+      ) as Academic["kind"];
+      if (kinds.has(kind)) fail(400, "同じ種類の学歴・検査は1つまでです。");
+      kinds.add(kind);
+      const r: Academic = {
+        kind,
+        catalogId: "",
+        school: "",
+        faculty: "",
+        department: "",
+        iq: null,
+      };
+      if (kind === "wais") r.iq = numeric(a.iq, 40, 200, "WAIS全検査IQ")!;
+      else {
+        const submitted = numeric(
+          a.submittedDeviation,
+          20,
+          90,
+          "申告した偏差値",
+          true,
+        );
+        if (submitted !== null) r.submittedDeviation = submitted;
+        const entry = a.catalogId
+          ? await one(
+              "SELECT * FROM catalog WHERE id=? AND kind=?",
+              text(a.catalogId),
+              kind,
+            )
+          : undefined;
+        if (entry) {
+          Object.assign(r, {
+            catalogId: entry.id,
+            school: entry.school,
+            faculty: entry.faculty,
+            department: entry.department,
+            deviation: entry.deviation,
+            year: entry.year,
+          });
+        } else {
+          r.school = text(a.school);
+          r.faculty = text(a.faculty || "");
+          r.department = text(a.department || "");
+          if (
+            !r.school ||
+            !r.department ||
+            (kind === "university" && !r.faculty)
           )
-        : undefined;
-      if (entry) {
-        Object.assign(r, {
-          catalogId: entry.id,
-          school: entry.school,
-          faculty: entry.faculty,
-          department: entry.department,
-          deviation: entry.deviation,
-          year: entry.year,
-        });
-      } else {
-        r.school = text(a.school);
-        r.faculty = text(a.faculty || "");
-        r.department = text(a.department || "");
-        if (!r.school || !r.department || (kind === "university" && !r.faculty))
-          fail(400, "学校・学部・学科名を入力してください。");
+            fail(400, "学校・学部・学科名を入力してください。");
+        }
       }
-    }
-    const trusted = previous?.academics.find(
-      (old) =>
-        old.kind === r.kind &&
-        old.school === r.school &&
-        old.faculty === r.faculty &&
-        old.department === r.department &&
-        old.catalogId === r.catalogId,
-    );
-    if (r.kind !== "wais" && trusted?.deviation !== undefined && !r.deviation) {
-      r.deviation = trusted.deviation;
-      if (trusted.year) r.year = trusted.year;
-    }
-    return r;
-  });
+      const trusted = previous?.academics.find(
+        (old) =>
+          old.kind === r.kind &&
+          old.school === r.school &&
+          old.faculty === r.faculty &&
+          old.department === r.department &&
+          old.catalogId === r.catalogId,
+      );
+      if (
+        r.kind !== "wais" &&
+        trusted?.deviation !== undefined &&
+        (r.submittedDeviation === undefined ||
+          r.submittedDeviation === trusted.deviation ||
+          r.submittedDeviation === trusted.submittedDeviation) &&
+        !r.deviation
+      ) {
+        r.deviation = trusted.deviation;
+        if (trusted.year) r.year = trusted.year;
+      }
+      return r;
+    }),
+  );
   p.semenDate = date(input.semenDate, true);
   p.semen = {};
   for (const f of SEMEN_FIELDS)
@@ -853,18 +1007,18 @@ function iqOf(p: ProfileData) {
     .filter((v): v is number => typeof v === "number");
   return values.length ? Math.max(...values) : null;
 }
-function donor(row: Row, viewer?: Row): Donor {
+async function donor(row: Row, viewer?: Row): Promise<Donor> {
   const p = normalizeProfile(JSON.parse(row.approved_json));
   const granted =
     viewer &&
     (viewer.id === row.id ||
       viewer.role === "admin" ||
-      one(
+      (await one(
         "SELECT id FROM conversations WHERE donor_id=? AND recipient_id=? AND disclosed=1 AND status='accepted'",
         row.id,
         viewer.id,
-      ));
-  const counts = one(
+      )));
+  const counts = await one(
     "SELECT SUM(CASE WHEN kind='donation' THEN 1 ELSE 0 END) donations,SUM(CASE WHEN kind='birth' THEN 1 ELSE 0 END) births FROM events WHERE donor_id=? AND status='confirmed'",
     row.id,
   );
@@ -888,8 +1042,8 @@ function donor(row: Row, viewer?: Row): Donor {
       : {}),
   };
 }
-function conversation(chatId: string, user: Row) {
-  const c = one("SELECT * FROM conversations WHERE id=?", chatId);
+async function conversation(chatId: string, user: Row) {
+  const c = await one("SELECT * FROM conversations WHERE id=?", chatId);
   if (
     !c ||
     (user.role !== "admin" &&
@@ -899,21 +1053,21 @@ function conversation(chatId: string, user: Row) {
     fail(404, "会話が見つかりません。");
   return c;
 }
-function checkFileAccess(file: Row, user: Row) {
+async function checkFileAccess(file: Row, user: Row) {
   if (user.role === "admin") return;
   if (file.kind === "chat") {
-    const c = conversation(file.conversation_id, user);
+    const c = await conversation(file.conversation_id, user);
     if (c.status !== "accepted") fail(403, "会話の承認が必要です。");
     return;
   }
   if (file.owner_id === user.id) return;
   if (
     file.kind === "photo" &&
-    one(
+    (await one(
       "SELECT id FROM conversations WHERE donor_id=? AND recipient_id=? AND status='accepted' AND disclosed=1",
       file.owner_id,
       user.id,
-    )
+    ))
   )
     return;
   fail(404, "ファイルが見つかりません。");
@@ -937,26 +1091,31 @@ const protectedFields = [
 function equalFields(a: Row, b: Row, keys: string[]) {
   return keys.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
 }
-function ensureDocuments(
+async function ensureDocuments(
   p: ProfileData,
   user: Row,
   fileIds: string[],
   previous?: ProfileData,
 ) {
-  const files = fileIds.map((fid) => {
-    const f = one(
-      "SELECT * FROM files WHERE id=? AND owner_id=? AND application_id IS NULL AND conversation_id IS NULL",
-      fid,
-      user.id,
-    );
-    if (!f || !DOC_LABELS[f.kind]) fail(400, "提出書類を確認してください。");
-    return f;
-  });
+  const files = await Promise.all(
+    fileIds.map(async (fid) => {
+      const f = await one(
+        "SELECT * FROM files WHERE id=? AND owner_id=? AND application_id IS NULL AND conversation_id IS NULL",
+        fid,
+        user.id,
+      );
+      if (!f || !DOC_LABELS[f.kind]) fail(400, "提出書類を確認してください。");
+      return f;
+    }),
+  );
   const has = (kind: string) => files.some((f) => f.kind === kind);
   const requireDoc = (kind: string) => {
     if (!has(kind)) fail(400, DOC_LABELS[kind] + "を添付してください。");
   };
-  if (!one("SELECT verified FROM profiles WHERE user_id=?", user.id)?.verified)
+  if (
+    !(await one("SELECT verified FROM profiles WHERE user_id=?", user.id))
+      ?.verified
+  )
     requireDoc("identity");
   if (!previous || !equalFields(p, previous, ["academics"]))
     for (const a of p.academics) requireDoc(a.kind);
@@ -983,31 +1142,39 @@ function ensureDocuments(
     requireDoc("infection");
   return files;
 }
-let paypalToken: { value: string; expires: number } | undefined;
-function paypalBase() {
-  return process.env.PAYPAL_ENVIRONMENT === "live"
-    ? "https://api-m.paypal.com"
-    : "https://api-m.sandbox.paypal.com";
-}
+let paypalToken:
+  | {
+      value: string;
+      expires: number;
+      key: string;
+    }
+  | undefined;
 async function paypal(
   pathname: string,
   method: string,
   payload?: unknown,
   requestId?: string,
 ) {
-  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET)
+  const settings = paypalConfiguration();
+  if (!settings.allowed) fail(503, "デモ環境では本番決済を利用できません。");
+  if (!settings.clientId || !settings.clientSecret)
     fail(503, "PayPalの接続設定が必要です。支払いは実行されていません。");
-  if (!paypalToken || paypalToken.expires < Date.now()) {
-    const res = await fetch(paypalBase() + "/v1/oauth2/token", {
+  const tokenKey = hash(
+    settings.baseURL + ":" + settings.clientId + ":" + settings.clientSecret,
+  );
+  if (
+    !paypalToken ||
+    paypalToken.key !== tokenKey ||
+    paypalToken.expires < Date.now()
+  ) {
+    const res = await fetch(settings.baseURL + "/v1/oauth2/token", {
       method: "POST",
       headers: {
         Authorization:
           "Basic " +
-          Buffer.from(
-            process.env.PAYPAL_CLIENT_ID +
-              ":" +
-              process.env.PAYPAL_CLIENT_SECRET,
-          ).toString("base64"),
+          Buffer.from(settings.clientId + ":" + settings.clientSecret).toString(
+            "base64",
+          ),
         "Content-Type": "application/x-www-form-urlencoded",
       },
       body: "grant_type=client_credentials",
@@ -1018,10 +1185,11 @@ async function paypal(
     const token = await res.json();
     paypalToken = {
       value: token.access_token,
+      key: tokenKey,
       expires: Date.now() + (Number(token.expires_in) - 60) * 1000,
     };
   }
-  const res = await fetch(paypalBase() + pathname, {
+  const res = await fetch(settings.baseURL + pathname, {
     method,
     headers: {
       Authorization: "Bearer " + paypalToken.value,
@@ -1057,10 +1225,93 @@ export function verifiedCapture(data: Row, applicationId: string) {
     );
   return capture.id as string;
 }
-export async function handle(req: Request, parts: string[]) {
+async function completePayPalOrder(app: Row) {
+  let order = await paypal("/v2/checkout/orders/" + app.paypal_order, "GET");
+  if (order.status !== "COMPLETED") {
+    if (order.status !== "APPROVED")
+      fail(409, "PayPalでの支払い承認がまだ完了していません。");
+    const units = order.purchase_units;
+    if (
+      !Array.isArray(units) ||
+      units.length !== 1 ||
+      units[0].custom_id !== app.id ||
+      units[0].amount?.currency_code !== "JPY" ||
+      Number(units[0].amount?.value) !== 5000
+    )
+      fail(409, "注文の金額または申請番号を確認できませんでした。");
+    order = await paypal(
+      "/v2/checkout/orders/" + app.paypal_order + "/capture",
+      "POST",
+      {},
+      app.id + "-capture",
+    );
+  }
+  return verifiedCapture(order, app.id);
+}
+async function handleRequest(req: Request, parts: string[]) {
   try {
+    await initializeApp();
     const method = req.method,
       key = parts.join("/");
+    if (key === "payments/webhook" && method === "POST") {
+      if (
+        process.env.PAYMENT_MODE !== "paypal" ||
+        !paypalConfiguration().webhookId
+      )
+        fail(503, "PayPalのWebhook設定が必要です。");
+      const event = await body(req);
+      const headers: Row = {};
+      for (const [field, header] of Object.entries({
+        auth_algo: "paypal-auth-algo",
+        cert_url: "paypal-cert-url",
+        transmission_id: "paypal-transmission-id",
+        transmission_sig: "paypal-transmission-sig",
+        transmission_time: "paypal-transmission-time",
+      })) {
+        const value = req.headers.get(header);
+        if (!value || value.length > 2048)
+          fail(400, "署名情報が不足しています。");
+        headers[field] = value;
+      }
+      const verified = await paypal(
+        "/v1/notifications/verify-webhook-signature",
+        "POST",
+        {
+          ...headers,
+          webhook_id: paypalConfiguration().webhookId,
+          webhook_event: event,
+        },
+      );
+      if (verified.verification_status !== "SUCCESS")
+        fail(401, "署名を確認できませんでした。");
+      const approvedEvent = event.event_type === "CHECKOUT.ORDER.APPROVED";
+      if (!approvedEvent && event.event_type !== "PAYMENT.CAPTURE.COMPLETED")
+        return json({ ok: true });
+      const orderId = approvedEvent
+        ? event.resource?.id
+        : event.resource?.supplementary_data?.related_ids?.order_id;
+      if (typeof orderId !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(orderId))
+        fail(400, "注文番号が不正です。");
+      const app = await one(
+        "SELECT * FROM applications WHERE paypal_order=?",
+        orderId,
+      );
+      // A deleted/withdrawn application must never be recreated by a late event.
+      if (!app) return json({ ok: true });
+      if (approvedEvent) {
+        if (app.paid || app.status !== "payment_pending")
+          return json({ ok: true });
+        const reference = await completePayPalOrder(app);
+        await markPaid(app.id, reference);
+        return json({ ok: true });
+      }
+      const order = await paypal("/v2/checkout/orders/" + orderId, "GET");
+      const reference = verifiedCapture(order, app.id);
+      if (reference !== event.resource?.id)
+        fail(409, "入金番号が一致しません。");
+      await markPaid(app.id, reference);
+      return json({ ok: true });
+    }
     if (!["GET", "HEAD"].includes(method)) {
       const origin = req.headers.get("origin"),
         expected = new URL(process.env.SITE_URL || req.url).origin;
@@ -1070,17 +1321,69 @@ export async function handle(req: Request, parts: string[]) {
       )
         fail(403, "別のサイトからの操作は受け付けられません。");
     }
+    if (key === "admin/mail-test" && method === "POST") {
+      const admin = await needUser(req, "admin");
+      await rate("mail-test:" + admin.id, 3, 3600000);
+      const recipient =
+        process.env.ADMIN_EMAIL || process.env.REVIEW_EMAIL || "";
+      if (
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient) ||
+        !process.env.SMTP_HOST ||
+        !process.env.MAIL_FROM
+      )
+        fail(503, "メール設定と運営者の受信アドレスを先に設定してください。");
+      await sendTestMail(recipient);
+      return json({ ok: true });
+    }
+    if (key === "public-config" && method === "GET")
+      return json({
+        operator: {
+          type:
+            process.env.OPERATOR_TYPE === "company" ? "company" : "individual",
+          representative:
+            process.env.OPERATOR_DISPLAY_MODE === "public"
+              ? process.env.OPERATOR_REPRESENTATIVE || ""
+              : "",
+          name:
+            process.env.OPERATOR_DISPLAY_MODE === "public"
+              ? process.env.OPERATOR_NAME || ""
+              : "",
+          address:
+            process.env.OPERATOR_DISPLAY_MODE === "public"
+              ? process.env.OPERATOR_ADDRESS || ""
+              : "",
+          phone:
+            process.env.OPERATOR_DISPLAY_MODE === "public"
+              ? process.env.OPERATOR_PHONE || ""
+              : "",
+          mode:
+            process.env.OPERATOR_DISPLAY_MODE === "public"
+              ? "public"
+              : "on_request",
+          disclosureReady:
+            process.env.OPERATOR_DISCLOSURE_READY === "yes" &&
+            !!(
+              process.env.OPERATOR_NAME &&
+              process.env.OPERATOR_ADDRESS &&
+              process.env.OPERATOR_PHONE &&
+              (process.env.OPERATOR_TYPE !== "company" ||
+                process.env.OPERATOR_REPRESENTATIVE)
+            ),
+        },
+      });
     if (key === "health" && method === "GET")
       return json({
         ok: true,
         mode: demo() ? "demo" : "live",
         paymentMode: process.env.PAYMENT_MODE || "paypal",
         paypalConfigured: !!(
-          process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET
+          paypalConfiguration().allowed &&
+          paypalConfiguration().clientId &&
+          paypalConfiguration().clientSecret
         ),
       });
     if (key === "me" && method === "GET") {
-      const u = sessionUser(req);
+      const u = await sessionUser(req);
       return json({
         user: u ? publicUser(u) : null,
         demo: demo(),
@@ -1097,7 +1400,10 @@ export async function handle(req: Request, parts: string[]) {
         admin: "demo_admin",
       }[b.role as Role];
       if (!uid) fail(400, "役割を選択してください。");
-      return loginResponse(one("SELECT * FROM users WHERE id=?", uid)!, req);
+      return await loginResponse(
+        (await one("SELECT * FROM users WHERE id=?", uid))!,
+        req,
+      );
     }
     if (key === "auth/signup" && method === "POST") {
       const b = await body(req),
@@ -1113,19 +1419,19 @@ export async function handle(req: Request, parts: string[]) {
         fail(400, "18歳以上の方が登録できます。生年月日を確認してください。");
       if (b.agreed !== true)
         fail(400, "利用規約と情報の取り扱いへの同意が必要です。");
-      rate(
+      await rate(
         "signup:" + (req.headers.get("x-forwarded-for") || "local"),
         30,
         3600000,
       );
-      if (one("SELECT id FROM users WHERE email=?", email))
+      if (await one("SELECT id FROM users WHERE email=?", email))
         fail(409, "このメールアドレスは登録されています。");
       const uid = id(),
         display =
           (role === "donor" ? "D-" : "R-") +
           randomBytes(3).toString("hex").toUpperCase();
-      transaction(() => {
-        run(
+      await transaction(async () => {
+        await run(
           "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
           uid,
           email,
@@ -1137,7 +1443,7 @@ export async function handle(req: Request, parts: string[]) {
           now(),
         );
         if (role === "donor")
-          run(
+          await run(
             "INSERT INTO profiles VALUES(?,?,?,?,?,NULL)",
             uid,
             "draft",
@@ -1146,29 +1452,29 @@ export async function handle(req: Request, parts: string[]) {
             0,
           );
       });
-      const created = one("SELECT * FROM users WHERE id=?", uid)!;
-      if (mailMode() !== "unconfigured") verifyEmail(created);
-      return loginResponse(created, req);
+      const created = (await one("SELECT * FROM users WHERE id=?", uid))!;
+      if (mailMode() !== "unconfigured") await verifyEmail(created);
+      return await loginResponse(created, req);
     }
     if (key === "auth/verify-email" && method === "POST") {
       const b = await body(req),
         token = text(b.token, 64);
       if (!/^[a-f0-9]{64}$/.test(token)) fail(400, "確認リンクが無効です。");
-      const item = one(
+      const item = await one(
         "SELECT * FROM email_tokens WHERE token_hash=? AND expires_at>?",
         hash(token),
         now(),
       );
       if (!item)
         fail(400, "確認リンクが無効か期限切れです。再送してください。");
-      transaction(() => {
-        run(
+      await transaction(async () => {
+        await run(
           "UPDATE users SET email_verified=1 WHERE id=? AND email=?",
           item.user_id,
           item.email,
         );
-        run("DELETE FROM email_tokens WHERE user_id=?", item.user_id);
-        run(
+        await run("DELETE FROM email_tokens WHERE user_id=?", item.user_id);
+        await run(
           "DELETE FROM mail_queue WHERE user_id=? AND kind='verify'",
           item.user_id,
         );
@@ -1176,23 +1482,23 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true });
     }
     if (key === "account/email-verification" && method === "POST") {
-      const u = needUser(req);
-      if (!u.email_verified) verifyEmail(u);
+      const u = await needUser(req);
+      if (!u.email_verified) await verifyEmail(u);
       return json({ ok: true, mailMode: mailMode() });
     }
     if (key === "account/settings" && method === "PATCH") {
-      const u = needUser(req),
+      const u = await needUser(req),
         b = await body(req);
       if (typeof b.emailNotifications !== "boolean")
         fail(400, "通知設定を確認してください。");
-      transaction(() => {
-        run(
+      await transaction(async () => {
+        await run(
           "UPDATE users SET email_notifications=? WHERE id=?",
           Number(b.emailNotifications),
           u.id,
         );
         if (!b.emailNotifications)
-          run(
+          await run(
             "DELETE FROM mail_queue WHERE user_id=? AND kind!='verify'",
             u.id,
           );
@@ -1200,11 +1506,11 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true });
     }
     if (key === "account/mail-preview" && method === "GET") {
-      const u = needUser(req);
+      const u = await needUser(req);
       if (!demo() || mailMode() !== "preview")
         fail(404, "この操作は利用できません。");
       return json({
-        mails: all(
+        mails: await all(
           "SELECT id,subject,body,created_at FROM mail_queue WHERE user_id=? AND status='preview' ORDER BY created_at DESC LIMIT 20",
           u.id,
         ),
@@ -1214,8 +1520,8 @@ export async function handle(req: Request, parts: string[]) {
       const b = await body(req),
         email = text(b.email, 254).toLowerCase(),
         password = text(b.password, 128);
-      rate("login:" + email, 10, 900000);
-      const u = one("SELECT * FROM users WHERE email=?", email);
+      await rate("login:" + email, 10, 900000);
+      const u = await one("SELECT * FROM users WHERE email=?", email);
       const matches = passwordMatches(
         password,
         u?.password_hash ||
@@ -1223,15 +1529,15 @@ export async function handle(req: Request, parts: string[]) {
       );
       if (!u || !matches)
         fail(401, "メールアドレスまたはパスワードが正しくありません。");
-      return loginResponse(u, req);
+      return await loginResponse(u, req);
     }
     if (key === "auth/logout" && method === "POST") {
-      const u = needUser(req);
+      const u = await needUser(req);
       const token = req.headers
         .get("cookie")
         ?.match(/(?:^|;\s*)kt_session=([^;]+)/)?.[1];
       if (token)
-        run(
+        await run(
           "DELETE FROM sessions WHERE token_hash=? AND user_id=?",
           hash(token),
           u.id,
@@ -1244,8 +1550,8 @@ export async function handle(req: Request, parts: string[]) {
       const url = new URL(req.url),
         query = (url.searchParams.get("q") || "").slice(0, 80),
         kind = url.searchParams.get("kind");
-      const rows = all(
-        "SELECT * FROM catalog WHERE (? IS NULL OR kind=?) AND (school LIKE ? OR department LIKE ?) ORDER BY school,faculty,department LIMIT 80",
+      const rows = await all(
+        "SELECT * FROM catalog WHERE (CAST(? AS TEXT) IS NULL OR kind=?) AND (school LIKE ? OR department LIKE ?) ORDER BY school,faculty,department LIMIT 80",
         kind,
         kind,
         "%" + query + "%",
@@ -1254,15 +1560,19 @@ export async function handle(req: Request, parts: string[]) {
       return json({ entries: rows });
     }
     if (key === "donors" && method === "GET") {
-      const u = sessionUser(req),
+      const u = await sessionUser(req),
         url = new URL(req.url),
         pref = url.searchParams.get("prefecture"),
         blood = url.searchParams.get("blood"),
         methodFilter = url.searchParams.get("method"),
         weekday = url.searchParams.get("weekday");
-      let rows = all(
-        "SELECT u.*,p.* FROM users u JOIN profiles p ON p.user_id=u.id WHERE p.status='approved' AND p.approved_json IS NOT NULL",
-      ).map((r) => donor(r, u));
+      let rows = await Promise.all(
+        (
+          await all(
+            "SELECT u.*,p.* FROM users u JOIN profiles p ON p.user_id=u.id WHERE p.status='approved' AND p.approved_json IS NOT NULL",
+          )
+        ).map(async (r) => await donor(r, u)),
+      );
       if (pref)
         rows = rows.filter((d) =>
           d.normalRegions
@@ -1324,8 +1634,8 @@ export async function handle(req: Request, parts: string[]) {
       return json({ donors: rows });
     }
     if (parts[0] === "donors" && parts.length === 2 && method === "GET") {
-      const u = sessionUser(req),
-        r = one(
+      const u = await sessionUser(req),
+        r = await one(
           "SELECT u.*,p.* FROM users u JOIN profiles p ON p.user_id=u.id WHERE u.id=? AND p.approved_json IS NOT NULL",
           parts[1],
         );
@@ -1334,12 +1644,69 @@ export async function handle(req: Request, parts: string[]) {
         (r.status !== "approved" && u?.id !== r.id && u?.role !== "admin")
       )
         fail(404, "提供者が見つかりません。");
-      return json({ donor: donor(r, u) });
+      return json({ donor: await donor(r, u) });
     }
-    if (key === "profile" && method === "GET") {
-      const u = needUser(req, "donor"),
-        p = one("SELECT * FROM profiles WHERE user_id=?", u.id)!;
+    const managedProfile =
+      parts[0] === "admin" &&
+      parts[1] === "donors" &&
+      parts.length === 4 &&
+      parts[3] === "profile";
+    if (key === "admin/donors" && method === "POST") {
+      await needUser(req, "admin");
+      const b = await body(req),
+        email = text(b.email, 254).toLowerCase(),
+        password = text(b.password, 128),
+        birth = date(b.birthDate, true);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+        fail(400, "メールアドレスを確認してください。");
+      if (password.length < 10)
+        fail(400, "パスワードは10文字以上で設定してください。");
+      if (ageOf(birth) < 18) fail(400, "18歳以上の方のみ登録できます。");
+      if (b.agreed !== true) fail(400, "登録者本人の同意を確認してください。");
+      const uid = id();
+      await transaction(async () => {
+        if (await one("SELECT id FROM users WHERE email=?", email))
+          fail(
+            409,
+            "このメールアドレスは登録済みです。既存のドナーを選ぶか、別のログイン用メールアドレスを指定してください。",
+          );
+        await run(
+          "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
+          uid,
+          email,
+          passwordHash(password),
+          "donor",
+          birth,
+          "D-" + randomBytes(3).toString("hex").toUpperCase(),
+          now(),
+          now(),
+        );
+        await run(
+          "INSERT INTO profiles VALUES(?,?,?,?,?,NULL)",
+          uid,
+          "draft",
+          JSON.stringify(emptyProfile()),
+          null,
+          0,
+        );
+      });
+      const created = (await one("SELECT * FROM users WHERE id=?", uid))!;
+      if (mailMode() !== "unconfigured") await verifyEmail(created);
+      return json({ user: publicUser(created) }, 201);
+    }
+    if ((key === "profile" || managedProfile) && method === "GET") {
+      let u: Row;
+      if (managedProfile) {
+        await needUser(req, "admin");
+        u = (await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          parts[2],
+        ))!;
+        if (!u) fail(404, "提供者が見つかりません。");
+      } else u = await needUser(req, "donor");
+      const p = (await one("SELECT * FROM profiles WHERE user_id=?", u.id))!;
       return json({
+        ...(managedProfile ? { user: publicUser(u) } : {}),
         profile: normalizeProfile(JSON.parse(p.data_json)),
         approved: p.approved_json
           ? normalizeProfile(JSON.parse(p.approved_json))
@@ -1347,21 +1714,148 @@ export async function handle(req: Request, parts: string[]) {
         status: p.status,
         verified: !!p.verified,
         photoId: p.photo_id,
-        documents: all(
+        documents: await all(
           "SELECT id,kind,original_name FROM files WHERE owner_id=? AND application_id IS NULL AND kind NOT IN ('photo','chat')",
           u.id,
         ),
-        applications: all(
-          "SELECT id,kind,status,paid,created_at,review_reason FROM applications WHERE user_id=? ORDER BY created_at DESC",
+        applications: await all(
+          "SELECT id,kind,status,paid,created_at,review_reason,approval_method FROM applications WHERE user_id=? ORDER BY created_at DESC",
           u.id,
         ),
       });
     }
+    if (managedProfile && method === "PATCH") {
+      await needUser(req, "admin");
+      const b = await body(req),
+        uid = parts[2];
+      await transaction(async () => {
+        const u = await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          uid,
+        );
+        if (!u) fail(404, "提供者が見つかりません。");
+        const current = (await one(
+          "SELECT * FROM profiles WHERE user_id=?",
+          uid,
+        ))!;
+        const birth = date(b.birthDate || u.birth_date, true);
+        if (ageOf(birth) < 18) fail(400, "18歳以上の方のみ登録できます。");
+        const p = await profileData(
+          b.profile,
+          current.approved_json ? JSON.parse(current.approved_json) : undefined,
+          birth,
+        );
+        for (const a of p.academics) {
+          const input = b.profile.academics.find((x: Row) => x.kind === a.kind);
+          if (
+            a.kind !== "wais" &&
+            !a.catalogId &&
+            input &&
+            (Object.hasOwn(input, "deviation") ||
+              Object.hasOwn(input, "submittedDeviation"))
+          ) {
+            const value = Object.hasOwn(input, "deviation")
+              ? input.deviation
+              : input.submittedDeviation;
+            if (value === null) delete a.deviation;
+            else a.deviation = numeric(value, 20, 90, "照合した偏差値")!;
+          }
+        }
+        if (b.publish !== true) {
+          await run(
+            "UPDATE profiles SET data_json=? WHERE user_id=?",
+            JSON.stringify(p),
+            uid,
+          );
+          return;
+        }
+        if (b.confirmed !== true)
+          fail(
+            400,
+            "本人確認・証明情報の照合と掲載への同意を確認してください。",
+          );
+        await run("UPDATE users SET birth_date=? WHERE id=?", birth, uid);
+        const active = await all(
+          "SELECT * FROM applications WHERE user_id=? AND status IN ('payment_pending','queued','reviewing','needs_changes')",
+          uid,
+        );
+        if (active.some((a) => !a.paid && a.paypal_order))
+          fail(
+            409,
+            "PayPalの決済手続きが進行中です。先に支払い状態を確認してください。入力内容は下書き保存できます。",
+          );
+        if (
+          !Array.isArray(b.fileIds) ||
+          b.fileIds.length > 16 ||
+          new Set(b.fileIds).size !== b.fileIds.length
+        )
+          fail(400, "提出書類を確認してください。");
+        const files = [];
+        for (const fid of b.fileIds) {
+          const f = await one(
+            "SELECT * FROM files WHERE id=? AND owner_id=? AND application_id IS NULL AND conversation_id IS NULL",
+            fid,
+            uid,
+          );
+          if (!f || !DOC_LABELS[f.kind])
+            fail(400, "提出書類を確認してください。");
+          files.push(f);
+        }
+        const paidApplication = active.find((a) => a.paid),
+          aid = paidApplication?.id || id();
+        const note =
+          "管理者による手入力・追加料金なし" +
+          (b.note ? "：" + text(b.note, 500) : "");
+        if (paidApplication) {
+          await run(
+            "UPDATE applications SET status='approved',data_json=?,approval_method='admin_entry',decided_at=?,review_reason=? WHERE id=?",
+            JSON.stringify(p),
+            now(),
+            note,
+            aid,
+          );
+        } else {
+          await run(
+            "INSERT INTO applications(id,user_id,kind,data_json,status,paid,created_at,decided_at,approval_method,review_reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            aid,
+            uid,
+            current.approved_json ? "update" : "initial",
+            JSON.stringify(p),
+            "approved",
+            0,
+            now(),
+            now(),
+            "admin_entry",
+            note,
+          );
+        }
+        for (const a of active)
+          if (a.id !== aid) {
+            await run(
+              "UPDATE applications SET status='withdrawn',review_reason=? WHERE id=?",
+              "管理者入力による置き換え（料金免除）",
+              a.id,
+            );
+            await deleteDocuments(a.id);
+          }
+        for (const f of files)
+          await run("UPDATE files SET application_id=? WHERE id=?", aid, f.id);
+        await run(
+          "UPDATE profiles SET data_json=?,approved_json=?,status='approved',verified=1 WHERE user_id=?",
+          JSON.stringify(p),
+          JSON.stringify(p),
+          uid,
+        );
+        await deleteDocuments(aid);
+      });
+      await cleanFiles();
+      return json({ ok: true, feeWaived: true });
+    }
     if (key === "profile" && method === "PATCH") {
-      const u = needUser(req, "donor"),
+      const u = await needUser(req, "donor"),
         b = await body(req),
-        current = one("SELECT * FROM profiles WHERE user_id=?", u.id)!,
-        p = profileData(
+        current = (await one("SELECT * FROM profiles WHERE user_id=?", u.id))!,
+        p = await profileData(
           b.profile,
           current.approved_json ? JSON.parse(current.approved_json) : undefined,
           u.birth_date,
@@ -1371,14 +1865,14 @@ export async function handle(req: Request, parts: string[]) {
         const old = JSON.parse(current.approved_json);
         if (!equalFields(p, old, protectedFields))
           fail(409, "証明情報の変更には有料の更新審査が必要です。");
-        run(
+        await run(
           "UPDATE profiles SET data_json=?,approved_json=? WHERE user_id=?",
           JSON.stringify(p),
           JSON.stringify(p),
           u.id,
         );
       } else
-        run(
+        await run(
           "UPDATE profiles SET data_json=? WHERE user_id=?",
           JSON.stringify(p),
           u.id,
@@ -1386,12 +1880,12 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true });
     }
     if (key === "profile/availability" && method === "POST") {
-      const u = needUser(req, "donor"),
+      const u = await needUser(req, "donor"),
         b = await body(req),
-        p = one("SELECT * FROM profiles WHERE user_id=?", u.id);
+        p = await one("SELECT * FROM profiles WHERE user_id=?", u.id);
       if (!p?.approved_json || !["approved", "paused"].includes(p.status))
         fail(409, "掲載承認後に変更できます。");
-      run(
+      await run(
         "UPDATE profiles SET status=? WHERE user_id=?",
         b.paused === true ? "paused" : "approved",
         u.id,
@@ -1399,16 +1893,16 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true });
     }
     if (key === "applications" && method === "POST") {
-      const u = needUser(req, "donor"),
+      const u = await needUser(req, "donor"),
         b = await body(req),
-        current = one("SELECT * FROM profiles WHERE user_id=?", u.id)!,
-        p = profileData(
+        current = (await one("SELECT * FROM profiles WHERE user_id=?", u.id))!,
+        p = await profileData(
           b.profile,
           current.approved_json ? JSON.parse(current.approved_json) : undefined,
           u.birth_date,
         );
       if (
-        one(
+        await one(
           "SELECT id FROM applications WHERE user_id=? AND status IN ('payment_pending','queued','reviewing','needs_changes')",
           u.id,
         )
@@ -1416,15 +1910,15 @@ export async function handle(req: Request, parts: string[]) {
         fail(409, "処理中の申請があります。先に現在の申請を完了してください。");
       if (!Array.isArray(b.fileIds) || b.fileIds.length > 16)
         fail(400, "提出書類を確認してください。");
-      const files = ensureDocuments(
+      const files = await ensureDocuments(
           p,
           u,
           b.fileIds,
           current.approved_json ? JSON.parse(current.approved_json) : undefined,
         ),
         aid = id();
-      transaction(() => {
-        run(
+      await transaction(async () => {
+        await run(
           "INSERT INTO applications(id,user_id,kind,data_json,status,created_at) VALUES(?,?,?,?,?,?)",
           aid,
           u.id,
@@ -1433,13 +1927,13 @@ export async function handle(req: Request, parts: string[]) {
           "payment_pending",
           now(),
         );
-        run(
+        await run(
           "UPDATE profiles SET data_json=? WHERE user_id=?",
           JSON.stringify(p),
           u.id,
         );
         for (const f of files)
-          run("UPDATE files SET application_id=? WHERE id=?", aid, f.id);
+          await run("UPDATE files SET application_id=? WHERE id=?", aid, f.id);
       });
       return json(
         { applicationId: aid, amount: 5000, status: "payment_pending" },
@@ -1452,8 +1946,8 @@ export async function handle(req: Request, parts: string[]) {
       parts[2] === "revise" &&
       method === "POST"
     ) {
-      const u = needUser(req, "donor"),
-        app = one(
+      const u = await needUser(req, "donor"),
+        app = await one(
           "SELECT * FROM applications WHERE id=? AND user_id=?",
           parts[1],
           u.id,
@@ -1461,46 +1955,53 @@ export async function handle(req: Request, parts: string[]) {
       if (!app || app.status !== "needs_changes")
         fail(409, "差し戻し中の申請ではありません。");
       const b = await body(req),
-        prev = one(
-          "SELECT approved_json FROM profiles WHERE user_id=?",
-          u.id,
+        prev = (
+          await one("SELECT approved_json FROM profiles WHERE user_id=?", u.id)
         )?.approved_json,
-        p = profileData(
+        p = await profileData(
           b.profile,
           prev ? JSON.parse(prev) : undefined,
           u.birth_date,
         );
-      const oldFiles = all(
+      const oldFiles = await all(
           "SELECT * FROM files WHERE application_id=?",
           app.id,
         ),
         ids = [...oldFiles.map((f) => f.id), ...(b.fileIds || [])];
       for (const f of oldFiles)
-        run("UPDATE files SET application_id=NULL WHERE id=?", f.id);
+        await run("UPDATE files SET application_id=NULL WHERE id=?", f.id);
       try {
-        const files = ensureDocuments(
+        const files = await ensureDocuments(
           p,
           u,
           ids,
           prev ? JSON.parse(prev) : undefined,
         );
-        transaction(() => {
-          run(
+        await transaction(async () => {
+          await run(
             "UPDATE applications SET data_json=?,status='queued',review_reason=NULL WHERE id=?",
             JSON.stringify(p),
             app.id,
           );
-          run(
+          await run(
             "UPDATE profiles SET data_json=? WHERE user_id=?",
             JSON.stringify(p),
             u.id,
           );
           for (const f of files)
-            run("UPDATE files SET application_id=? WHERE id=?", app.id, f.id);
+            await run(
+              "UPDATE files SET application_id=? WHERE id=?",
+              app.id,
+              f.id,
+            );
         });
       } catch (e) {
         for (const f of oldFiles)
-          run("UPDATE files SET application_id=? WHERE id=?", app.id, f.id);
+          await run(
+            "UPDATE files SET application_id=? WHERE id=?",
+            app.id,
+            f.id,
+          );
         throw e;
       }
       return json({ ok: true, additionalCharge: 0 });
@@ -1510,8 +2011,8 @@ export async function handle(req: Request, parts: string[]) {
       parts.length === 2 &&
       method === "DELETE"
     ) {
-      const u = needUser(req, "donor"),
-        app = one(
+      const u = await needUser(req, "donor"),
+        app = await one(
           "SELECT * FROM applications WHERE id=? AND user_id=?",
           parts[1],
           u.id,
@@ -1523,18 +2024,18 @@ export async function handle(req: Request, parts: string[]) {
         app.paypal_order
       )
         fail(409, "決済手続き開始前の未払い申請のみ取り消せます。");
-      transaction(() => {
-        run(
+      await transaction(async () => {
+        await run(
           "UPDATE files SET application_id=NULL WHERE application_id=?",
           app.id,
         );
-        run("DELETE FROM applications WHERE id=?", app.id);
+        await run("DELETE FROM applications WHERE id=?", app.id);
       });
       return json({ ok: true });
     }
     if (parts[0] === "payments" && parts.length === 3 && method === "POST") {
-      const u = needUser(req, "donor"),
-        app = one(
+      const u = await needUser(req, "donor"),
+        app = await one(
           "SELECT * FROM applications WHERE id=? AND user_id=?",
           parts[1],
           u.id,
@@ -1546,11 +2047,7 @@ export async function handle(req: Request, parts: string[]) {
       if (parts[2] === "demo") {
         if (!demo() || process.env.PAYMENT_MODE !== "demo")
           fail(404, "デモ支払いは利用できません。");
-        run(
-          "UPDATE applications SET paid=1,status='queued',payment_ref=? WHERE id=? AND paid=0",
-          "demo:" + id(),
-          app.id,
-        );
+        await markPaid(app.id, "demo:" + id());
         return json({ paid: true, demo: true });
       }
       if (process.env.PAYMENT_MODE !== "paypal")
@@ -1601,7 +2098,7 @@ export async function handle(req: Request, parts: string[]) {
           )
         )
           fail(502, "決済先を確認できませんでした。");
-        run(
+        await run(
           "UPDATE applications SET paypal_order=? WHERE id=?",
           order.id,
           app.id,
@@ -1610,50 +2107,48 @@ export async function handle(req: Request, parts: string[]) {
       }
       if (parts[2] === "capture") {
         if (!app.paypal_order) fail(409, "先に決済手続きを開始してください。");
-        let order = await paypal(
-          "/v2/checkout/orders/" + app.paypal_order,
-          "GET",
-        );
-        if (order.status !== "COMPLETED")
-          order = await paypal(
-            "/v2/checkout/orders/" + app.paypal_order + "/capture",
-            "POST",
-            {},
-            app.id + "-capture",
-          );
-        const ref = verifiedCapture(order, app.id);
-        run(
-          "UPDATE applications SET paid=1,status='queued',payment_ref=? WHERE id=? AND paid=0",
-          ref,
-          app.id,
-        );
+        const ref = await completePayPalOrder(app);
+        await markPaid(app.id, ref);
         return json({ paid: true });
       }
     }
     if (key === "files" && method === "POST") {
-      const u = needUser(req),
-        raw = await bounded(req, 10 * 1024 * 1024),
+      let u = await needUser(req);
+      const raw = await bounded(req, 4 * 1024 * 1024),
         form = await new Request(req.url, {
           method: "POST",
           headers: { "Content-Type": req.headers.get("content-type") || "" },
           body: raw,
         }).formData();
+      const managedOwner = form.get("ownerId");
+      if (managedOwner) {
+        if (u.role !== "admin") fail(403, "管理者権限が必要です。");
+        const target = await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          text(managedOwner, 100),
+        );
+        if (!target) fail(404, "提供者が見つかりません。");
+        u = target;
+      }
       const kind = String(form.get("kind") || ""),
         chatId = String(form.get("conversationId") || "");
+      if (managedOwner && kind === "chat")
+        fail(403, "代理登録ではプロフィール書類のみアップロードできます。");
       if (![...Object.keys(DOC_LABELS), "photo", "chat"].includes(kind))
         fail(400, "書類の種類を選択してください。");
       if (kind !== "chat" && u.role !== "donor")
         fail(403, "提供者のみ登録できます。");
       if (
         kind === "chat" &&
-        (u.role === "admin" || conversation(chatId, u).status !== "accepted")
+        (u.role === "admin" ||
+          (await conversation(chatId, u)).status !== "accepted")
       )
         fail(409, "会話が承認されていません。");
       if (
-        one(
+        (await one(
           "SELECT COUNT(*) count FROM files WHERE owner_id=? AND application_id IS NULL AND kind NOT IN ('photo','chat')",
           u.id,
-        )!.count >= 20 &&
+        ))!.count >= 20 &&
         kind !== "chat" &&
         kind !== "photo"
       )
@@ -1662,9 +2157,9 @@ export async function handle(req: Request, parts: string[]) {
       if (
         !(file instanceof File) ||
         file.size === 0 ||
-        file.size > (kind === "photo" || kind === "chat" ? 5 : 8) * 1024 * 1024
+        file.size > 3 * 1024 * 1024
       )
-        fail(400, "画像は5MB、証明書は8MB以内にしてください。");
+        fail(400, "画像・証明書は1ファイル3MB以内にしてください。");
       let bytes: Buffer = Buffer.from(await file.arrayBuffer()),
         mime: string,
         ext: string;
@@ -1680,7 +2175,7 @@ export async function handle(req: Request, parts: string[]) {
         if (!["image/jpeg", "image/png", "image/webp"].includes(file.type))
           fail(400, "JPEG・PNG・WebP画像、または証明書PDFを選んでください。");
         try {
-          bytes = await sharp(bytes, { limitInputPixels: 24_000_000 })
+          bytes = await sharp(bytes, { limitInputPixels: 24000000 })
             .rotate()
             .resize({
               width: 1800,
@@ -1698,11 +2193,16 @@ export async function handle(req: Request, parts: string[]) {
       }
       const fid = id(),
         storage = randomBytes(24).toString("hex") + "." + ext;
-      writeFileSync(path.join(dataDir(), "uploads", storage), bytes, {
-        mode: 0o600,
-      });
-      transaction(() => {
-        run(
+      // Reserve cleanup before uploading, so a crash between Blob and DB writes
+      // cannot leave a certificate indefinitely. The grace period avoids racing an upload.
+      await run(
+        "INSERT INTO file_gc(file_key,not_before) VALUES(?,?)",
+        storage,
+        Date.now() + 3600000,
+      );
+      await putUpload(storage, bytes);
+      await transaction(async () => {
+        await run(
           "INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
           fid,
           u.id,
@@ -1714,34 +2214,42 @@ export async function handle(req: Request, parts: string[]) {
           path.basename(file.name).slice(0, 120),
           now(),
         );
+        await run("DELETE FROM file_gc WHERE file_key=?", storage);
         if (kind === "photo") {
-          const old = one(
-            "SELECT photo_id FROM profiles WHERE user_id=?",
-            u.id,
+          const old = (
+            await one("SELECT photo_id FROM profiles WHERE user_id=?", u.id)
           )?.photo_id;
           if (old) {
-            const f = one("SELECT file_key FROM files WHERE id=?", old);
-            if (f) run("INSERT OR IGNORE INTO file_gc VALUES(?)", f.file_key);
-            run("DELETE FROM files WHERE id=?", old);
+            const f = await one("SELECT file_key FROM files WHERE id=?", old);
+            if (f)
+              await run(
+                "INSERT OR IGNORE INTO file_gc(file_key) VALUES(?)",
+                f.file_key,
+              );
+            await run("DELETE FROM files WHERE id=?", old);
           }
-          run("UPDATE profiles SET photo_id=? WHERE user_id=?", fid, u.id);
+          await run(
+            "UPDATE profiles SET photo_id=? WHERE user_id=?",
+            fid,
+            u.id,
+          );
         }
       });
-      cleanFiles();
+      await cleanFiles();
       return json(
         { file: { id: fid, kind, original_name: file.name.slice(0, 120) } },
         201,
       );
     }
     if (parts[0] === "files" && parts.length === 2) {
-      const u = needUser(req),
-        file = one("SELECT * FROM files WHERE id=?", parts[1]);
+      const u = await needUser(req),
+        file = await one("SELECT * FROM files WHERE id=?", parts[1]);
       if (!file) fail(404, "ファイルが見つかりません。");
-      checkFileAccess(file, u);
+      await checkFileAccess(file, u);
       if (method === "GET") {
-        const p = path.join(dataDir(), "uploads", file.file_key);
-        if (!existsSync(p)) fail(404, "ファイルが見つかりません。");
-        return new Response(readFileSync(p), {
+        const bytes = await readUpload(file.file_key);
+        if (!bytes) fail(404, "ファイルが見つかりません。");
+        return new Response(new Uint8Array(bytes).buffer, {
           headers: {
             "Content-Type": file.mime,
             "Cache-Control": "private, no-store",
@@ -1756,31 +2264,39 @@ export async function handle(req: Request, parts: string[]) {
       }
       if (method === "DELETE") {
         if (
-          file.owner_id !== u.id ||
+          (file.owner_id !== u.id && u.role !== "admin") ||
           file.application_id ||
           (file.kind === "chat" &&
-            one("SELECT id FROM messages WHERE file_id=?", file.id))
+            (await one("SELECT id FROM messages WHERE file_id=?", file.id)))
         )
           fail(403, "このファイルは削除できません。");
-        run("INSERT OR IGNORE INTO file_gc VALUES(?)", file.file_key);
-        run("DELETE FROM files WHERE id=?", file.id);
+        await run(
+          "INSERT OR IGNORE INTO file_gc(file_key) VALUES(?)",
+          file.file_key,
+        );
+        await run("DELETE FROM files WHERE id=?", file.id);
         if (file.kind === "photo")
-          run("UPDATE profiles SET photo_id=NULL WHERE user_id=?", u.id);
-        cleanFiles();
+          await run(
+            "UPDATE profiles SET photo_id=NULL WHERE user_id=?",
+            file.owner_id,
+          );
+        await cleanFiles();
         return json({ ok: true });
       }
     }
     if (key === "conversations" && method === "GET") {
-      const u = needUser(req),
-        rows = all(
+      const u = await needUser(req),
+        rows = await all(
           "SELECT c.*,d.display_id donor_name,r.display_id recipient_name FROM conversations c JOIN users d ON d.id=c.donor_id JOIN users r ON r.id=c.recipient_id WHERE (?='admin' OR c.donor_id=? OR c.recipient_id=?) ORDER BY c.created_at DESC",
           u.role,
           u.id,
           u.id,
         );
-      const tombstones = all(
-        "SELECT id,created_at FROM chat_tombstones WHERE survivor_id=? ORDER BY created_at DESC",
-        u.id,
+      const tombstones = (
+        await all(
+          "SELECT id,created_at FROM chat_tombstones WHERE survivor_id=? ORDER BY created_at DESC",
+          u.id,
+        )
       ).map((r) => ({
         ...r,
         status: "deleted",
@@ -1790,14 +2306,14 @@ export async function handle(req: Request, parts: string[]) {
       return json({ conversations: [...rows, ...tombstones] });
     }
     if (key === "conversations" && method === "POST") {
-      const u = needUser(req, "recipient"),
+      const u = await needUser(req, "recipient"),
         b = await body(req),
-        p = one(
+        p = await one(
           "SELECT * FROM profiles WHERE user_id=? AND status='approved'",
           text(b.donorId),
         );
       if (!p) fail(404, "現在、会話を申請できる提供者ではありません。");
-      const existing = one(
+      const existing = await one(
         "SELECT * FROM conversations WHERE donor_id=? AND recipient_id=?",
         p.user_id,
         u.id,
@@ -1807,9 +2323,9 @@ export async function handle(req: Request, parts: string[]) {
           fail(403, "この提供者への申請は受け付けられません。");
         return json({ conversationId: existing.id });
       }
-      rate("conversation:" + u.id, 20, 3600000);
+      await rate("conversation:" + u.id, 20, 3600000);
       const cid = id();
-      run(
+      await run(
         "INSERT INTO conversations(id,donor_id,recipient_id,status,created_at) VALUES(?,?,?,?,?)",
         cid,
         p.user_id,
@@ -1817,21 +2333,21 @@ export async function handle(req: Request, parts: string[]) {
         "requested",
         now(),
       );
-      chatMail(p.user_id, cid, "request");
+      await chatMail(p.user_id, cid, "request");
       return json({ conversationId: cid }, 201);
     }
     if (parts[0] === "conversations" && parts.length === 2) {
-      const u = needUser(req),
-        c = conversation(parts[1], u);
+      const u = await needUser(req),
+        c = await conversation(parts[1], u);
       if (method === "GET") {
-        const messages = all(
+        const messages = await all(
           "SELECT m.*,u.display_id sender_name FROM messages m JOIN users u ON u.id=m.sender_id WHERE conversation_id=? ORDER BY created_at,id",
           c.id,
         );
         return json({
           conversation: c,
           messages,
-          events: all(
+          events: await all(
             "SELECT * FROM events WHERE conversation_id=? ORDER BY created_at DESC",
             c.id,
           ),
@@ -1842,23 +2358,24 @@ export async function handle(req: Request, parts: string[]) {
         if (b.action === "accept" || b.action === "decline") {
           if (c.donor_id !== u.id || c.status !== "requested")
             fail(403, "提供者のみ申請を判断できます。");
-          run(
+          await run(
             "UPDATE conversations SET status=? WHERE id=?",
             b.action === "accept" ? "accepted" : "declined",
             c.id,
           );
-          if (b.action === "accept") chatMail(c.recipient_id, c.id, "accept");
+          if (b.action === "accept")
+            await chatMail(c.recipient_id, c.id, "accept");
         } else if (b.action === "disclose") {
           if (c.donor_id !== u.id || c.status !== "accepted")
             fail(403, "提供者のみ開示を変更できます。");
-          run(
+          await run(
             "UPDATE conversations SET disclosed=? WHERE id=?",
             b.enabled === true ? 1 : 0,
             c.id,
           );
         } else if (b.action === "block") {
           if (u.role === "admin") fail(403, "管理者はこの操作を行えません。");
-          run(
+          await run(
             "UPDATE conversations SET status='blocked',disclosed=0 WHERE id=?",
             c.id,
           );
@@ -1872,15 +2389,15 @@ export async function handle(req: Request, parts: string[]) {
       parts[2] === "messages" &&
       method === "POST"
     ) {
-      const u = needUser(req),
-        c = conversation(parts[1], u);
+      const u = await needUser(req),
+        c = await conversation(parts[1], u);
       if (c.status !== "accepted" || u.role === "admin")
         fail(403, "承認された会話の当事者のみ送信できます。");
       const b = await body(req),
         message = text(b.body || "", 4000);
       let fid: string | null = null;
       if (b.fileId) {
-        const file = one(
+        const file = await one(
           "SELECT * FROM files WHERE id=? AND owner_id=? AND conversation_id=? AND kind='chat'",
           text(b.fileId),
           u.id,
@@ -1891,9 +2408,9 @@ export async function handle(req: Request, parts: string[]) {
       }
       if (!message && !fid)
         fail(400, "メッセージまたは画像を入力してください。");
-      rate("message:" + u.id, 60, 60000);
+      await rate("message:" + u.id, 60, 60000);
       const mid = id();
-      run(
+      await run(
         "INSERT INTO messages VALUES(?,?,?,?,?,?)",
         mid,
         c.id,
@@ -1902,7 +2419,7 @@ export async function handle(req: Request, parts: string[]) {
         fid,
         now(),
       );
-      chatMail(
+      await chatMail(
         c.donor_id === u.id ? c.recipient_id : c.donor_id,
         c.id,
         "message",
@@ -1915,18 +2432,18 @@ export async function handle(req: Request, parts: string[]) {
       parts[2] === "report" &&
       method === "POST"
     ) {
-      const u = needUser(req),
-        c = conversation(parts[1], u),
+      const u = await needUser(req),
+        c = await conversation(parts[1], u),
         b = await body(req),
         reason = choice(
           b.reason,
           ["迷惑行為", "虚偽情報", "無断開示", "その他"],
           "通報理由",
         );
-      db().exec(
+      await exec(
         "CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,user_id TEXT REFERENCES users(id) ON DELETE CASCADE,reason TEXT,created_at TEXT)",
       );
-      run(
+      await run(
         "INSERT INTO reports VALUES(?,?,?,?,?)",
         id(),
         c.id,
@@ -1942,14 +2459,14 @@ export async function handle(req: Request, parts: string[]) {
       parts[2] === "events" &&
       method === "POST"
     ) {
-      const u = needUser(req, "donor"),
-        c = conversation(parts[1], u);
+      const u = await needUser(req, "donor"),
+        c = await conversation(parts[1], u);
       if (c.status !== "accepted" || c.donor_id !== u.id)
         fail(403, "承認済みの会話で登録してください。");
       const b = await body(req),
         kind = choice(b.kind, ["donation", "pregnancy", "birth"], "実績"),
         occurred = date(b.date, true);
-      run(
+      await run(
         "INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",
         id(),
         c.id,
@@ -1963,8 +2480,8 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true }, 201);
     }
     if (parts[0] === "events" && parts.length === 2 && method === "PATCH") {
-      const u = needUser(req, "recipient"),
-        event = one(
+      const u = await needUser(req, "recipient"),
+        event = await one(
           "SELECT * FROM events WHERE id=? AND recipient_id=?",
           parts[1],
           u.id,
@@ -1972,7 +2489,7 @@ export async function handle(req: Request, parts: string[]) {
       if (!event || event.status !== "pending")
         fail(404, "確認待ちの実績が見つかりません。");
       const b = await body(req);
-      run(
+      await run(
         "UPDATE events SET status=? WHERE id=?",
         b.confirmed === true ? "confirmed" : "rejected",
         event.id,
@@ -1980,19 +2497,27 @@ export async function handle(req: Request, parts: string[]) {
       return json({ ok: true });
     }
     if (key === "admin/applications" && method === "GET") {
-      needUser(req, "admin");
+      await needUser(req, "admin");
       return json({
-        applications: all(
-          "SELECT a.*,u.display_id,u.birth_date,u.email FROM applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC",
-        ).map((a) => ({
-          ...a,
-          profile: JSON.parse(a.data_json),
-          data_json: undefined,
-          files: all(
-            "SELECT id,kind,original_name FROM files WHERE application_id=?",
-            a.id,
-          ),
-        })),
+        applications: await Promise.all(
+          (
+            await all(
+              "SELECT a.*,u.display_id,u.birth_date,u.email FROM applications a JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC",
+            )
+          ).map(async (a) => ({
+            ...a,
+            profile: JSON.parse(a.data_json),
+            data_json: undefined,
+            files: await all(
+              "SELECT id,kind,original_name FROM files WHERE application_id=?",
+              a.id,
+            ),
+            reviewMail: await one(
+              "SELECT status,attempts,body FROM review_mail WHERE application_id=?",
+              a.id,
+            ),
+          })),
+        ),
       });
     }
     if (
@@ -2001,15 +2526,15 @@ export async function handle(req: Request, parts: string[]) {
       parts.length === 3 &&
       method === "PATCH"
     ) {
-      needUser(req, "admin");
-      const app = one("SELECT * FROM applications WHERE id=?", parts[2]);
+      await needUser(req, "admin");
+      const app = await one("SELECT * FROM applications WHERE id=?", parts[2]);
       if (!app) fail(404, "申請が見つかりません。");
       if (!app.paid) fail(409, "支払い完了後に審査を開始できます。");
       const b = await body(req);
       if (b.action === "start") {
         if (app.status !== "queued")
           fail(409, "審査を開始できる状態ではありません。");
-        run(
+        await run(
           "UPDATE applications SET status='reviewing',review_started_at=? WHERE id=?",
           now(),
           app.id,
@@ -2030,21 +2555,22 @@ export async function handle(req: Request, parts: string[]) {
             }
           }
         }
-        transaction(() => {
-          run(
+        await transaction(async () => {
+          await run(
             "UPDATE profiles SET data_json=?,approved_json=?,status='approved',verified=1 WHERE user_id=?",
             JSON.stringify(p),
             JSON.stringify(p),
             app.user_id,
           );
-          run(
-            "UPDATE applications SET status='approved',data_json=? WHERE id=?",
+          await run(
+            "UPDATE applications SET status='approved',data_json=?,approval_method='manual',decided_at=? WHERE id=?",
             JSON.stringify(p),
+            now(),
             app.id,
           );
-          deleteDocuments(app.id);
+          await deleteDocuments(app.id);
         });
-        cleanFiles();
+        await cleanFiles();
         return json({ ok: true });
       }
       if (b.action === "revise" || b.action === "reject") {
@@ -2058,25 +2584,25 @@ export async function handle(req: Request, parts: string[]) {
           ],
           "理由",
         );
-        transaction(() => {
-          run(
+        await transaction(async () => {
+          await run(
             "UPDATE applications SET status=?,review_reason=? WHERE id=?",
             b.action === "revise" ? "needs_changes" : "rejected",
             reason,
             app.id,
           );
-          if (b.action === "reject") deleteDocuments(app.id);
+          if (b.action === "reject") await deleteDocuments(app.id);
         });
-        cleanFiles();
+        await cleanFiles();
         return json({ ok: true });
       }
       fail(400, "審査操作を確認してください。");
     }
     if (key === "admin/donors" && method === "GET") {
-      needUser(req, "admin");
+      await needUser(req, "admin");
       return json({
-        donors: all(
-          "SELECT u.id,u.display_id,p.status FROM users u JOIN profiles p ON p.user_id=u.id",
+        donors: await all(
+          "SELECT u.id,u.display_id,u.email,p.status FROM users u JOIN profiles p ON p.user_id=u.id WHERE u.role='donor' ORDER BY u.created_at DESC",
         ),
       });
     }
@@ -2086,63 +2612,200 @@ export async function handle(req: Request, parts: string[]) {
       parts.length === 3 &&
       method === "PATCH"
     ) {
-      needUser(req, "admin");
+      await needUser(req, "admin");
       const b = await body(req),
-        p = one("SELECT * FROM profiles WHERE user_id=?", parts[2]);
+        p = await one("SELECT * FROM profiles WHERE user_id=?", parts[2]);
       if (!p?.approved_json) fail(409, "未承認の提供者です。");
-      run(
+      await run(
         "UPDATE profiles SET status=? WHERE user_id=?",
         b.paused === true ? "suspended" : "approved",
         parts[2],
       );
       return json({ ok: true });
     }
+    if (key === "support" && method === "GET") {
+      const user = await needUser(req);
+      return json({
+        tickets: (
+          await all(
+            "SELECT * FROM support_tickets WHERE user_id=? ORDER BY updated_at DESC LIMIT 100",
+            user.id,
+          )
+        ).map(supportSummary),
+      });
+    }
+    if (key === "support" && method === "POST") {
+      const user = await sessionUser(req),
+        b = await body(req);
+      if (b.website) fail(400, "入力内容を確認してください。");
+      const category = choice(
+        b.category,
+        [
+          "登録・ログイン",
+          "支払い・返金",
+          "掲載・審査",
+          "不具合",
+          "運営者情報の開示請求",
+          "その他",
+        ],
+        "お問い合わせの種類",
+      );
+      const subject = supportText(b.subject, 100, "件名"),
+        content = supportText(b.body, 4000, "本文");
+      await rate(
+        "support-new:" + (user?.id || "guest"),
+        user ? 5 : 30,
+        3600000,
+      );
+      const ticketId = id(),
+        token = user ? null : randomBytes(32).toString("base64url"),
+        time = now();
+      await transaction(async () => {
+        await run(
+          "INSERT INTO support_tickets(id,user_id,token_hash,category,subject,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+          ticketId,
+          user?.id || null,
+          token ? hash(token) : null,
+          category,
+          subject,
+          time,
+          time,
+        );
+        await run(
+          "INSERT INTO support_messages VALUES(?,?,?,?,?)",
+          id(),
+          ticketId,
+          "user",
+          content,
+          time,
+        );
+      });
+      return json({ id: ticketId, accessToken: token }, 201);
+    }
+    if (key === "admin/support" && method === "GET") {
+      await needUser(req, "admin");
+      return json({
+        tickets: (
+          await all(
+            "SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT 300",
+          )
+        ).map(supportSummary),
+      });
+    }
+    if (parts[0] === "support" && parts.length === 2) {
+      const { ticket, user } = await supportAccess(req, parts[1]);
+      if (method === "GET")
+        return json({
+          ticket: supportSummary(ticket),
+          messages: await all(
+            "SELECT id,sender,body,created_at FROM support_messages WHERE ticket_id=? ORDER BY created_at,id",
+            ticket.id,
+          ),
+        });
+      if (method === "POST") {
+        const b = await body(req),
+          content = supportText(b.body, 4000, "本文");
+        if (ticket.status === "closed")
+          fail(
+            409,
+            "対応済みの問い合わせです。新しい問い合わせを作成してください。",
+          );
+        await rate("support-reply:" + (user?.id || ticket.id), 10, 60000);
+        if (
+          Number(
+            (
+              await one(
+                "SELECT count(*) n FROM support_messages WHERE ticket_id=?",
+                ticket.id,
+              )
+            )?.n,
+          ) >= 100
+        )
+          fail(
+            409,
+            "この問い合わせの返信上限です。新しい問い合わせを作成してください。",
+          );
+        await transaction(async () => {
+          await run(
+            "INSERT INTO support_messages VALUES(?,?,?,?,?)",
+            id(),
+            ticket.id,
+            user?.role === "admin" ? "admin" : "user",
+            content,
+            now(),
+          );
+          await run(
+            "UPDATE support_tickets SET status=?,updated_at=? WHERE id=?",
+            user?.role === "admin" ? "answered" : "open",
+            now(),
+            ticket.id,
+          );
+        });
+        return json({ ok: true }, 201);
+      }
+      if (method === "PATCH") {
+        const b = await body(req);
+        if (b.status !== "closed") fail(400, "対応状況を確認してください。");
+        await run(
+          "UPDATE support_tickets SET status='closed',updated_at=? WHERE id=?",
+          now(),
+          ticket.id,
+        );
+        return json({ ok: true });
+      }
+      if (method === "DELETE") {
+        await run("DELETE FROM support_tickets WHERE id=?", ticket.id);
+        return json({ ok: true });
+      }
+    }
     if (key === "admin/reports" && method === "GET") {
-      needUser(req, "admin");
-      const exists = one("SELECT name FROM sqlite_master WHERE name='reports'");
+      await needUser(req, "admin");
+      const exists = true;
       return json({
         reports: exists
-          ? all("SELECT * FROM reports ORDER BY created_at DESC")
+          ? await all("SELECT * FROM reports ORDER BY created_at DESC")
           : [],
       });
     }
     if (key === "account" && method === "DELETE") {
-      const u = needUser(req),
+      const u = await needUser(req),
         b = await body(req);
       if (b.confirm !== true) fail(400, "削除の確認が必要です。");
       if (u.role === "admin")
         fail(403, "管理者アカウントの削除は運用手順から実施してください。");
-      const chats = all(
+      const chats = await all(
         "SELECT * FROM conversations WHERE donor_id=? OR recipient_id=?",
         u.id,
         u.id,
       );
-      const files = all(
+      const files = await all(
         "SELECT file_key FROM files WHERE owner_id=? OR conversation_id IN (SELECT id FROM conversations WHERE donor_id=? OR recipient_id=?)",
         u.id,
         u.id,
         u.id,
       );
-      transaction(() => {
+      await transaction(async () => {
         for (const c of chats)
-          run(
+          await run(
             "INSERT INTO chat_tombstones VALUES(?,?,?)",
             id(),
             c.donor_id === u.id ? c.recipient_id : c.donor_id,
             now(),
           );
         for (const f of files)
-          run("INSERT OR IGNORE INTO file_gc VALUES(?)", f.file_key);
-        run("DELETE FROM users WHERE id=?", u.id);
+          await run(
+            "INSERT OR IGNORE INTO file_gc(file_key) VALUES(?)",
+            f.file_key,
+          );
+        await run("DELETE FROM users WHERE id=?", u.id);
       });
-      cleanFiles();
-      db().exec(
-        "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
-      );
+      await cleanFiles();
+      await compactLocalDatabase();
       return json(
         {
           ok: true,
-          pendingFileCleanup: one("SELECT COUNT(*) count FROM file_gc")!.count,
+          pendingFileCleanup: (await one("SELECT COUNT(*) count FROM file_gc"))!
+            .count,
         },
         200,
         { "Set-Cookie": sessionCookie("", req, 0) },
@@ -2162,3 +2825,57 @@ export async function handle(req: Request, parts: string[]) {
     );
   }
 }
+
+export async function handle(req: Request, parts: string[]) {
+  const mutation = !["GET", "HEAD"].includes(req.method);
+  if (mutation && remoteStorage()) {
+    try {
+      await wakeMaintenance();
+    } catch {
+      return json(
+        { error: "処理の予約に失敗しました。時間をおいて再度お試しください。" },
+        503,
+      );
+    }
+  }
+  const response = await handleRequest(req, parts);
+  if (mutation && response.ok) {
+    // Await delivery: serverless runtimes may freeze immediately after the response.
+    try {
+      await flushMail();
+    } catch {
+      console.error("メール送信は保留されました。");
+    }
+  }
+  return response;
+}
+export async function runMaintenance() {
+  await initializeApp();
+  await processReviewDeadlines();
+  await flushMail(1, 3000);
+  await run("DELETE FROM rate_limits WHERE expires_at<?", Date.now());
+  await run("DELETE FROM sessions WHERE expires_at<?", now());
+  await run("DELETE FROM email_tokens WHERE expires_at<?", now());
+}
+export async function nextMaintenanceTime(): Promise<number | null> {
+  const due = await one(
+    "SELECT MIN(a.paid_at) AS at FROM applications a JOIN profiles p ON p.user_id=a.user_id WHERE a.paid=1 AND a.status IN ('queued','reviewing') AND p.status NOT IN ('suspended','paused')",
+  );
+  const dates: number[] = due?.at ? [Date.parse(due.at) + 30 * 86400000] : [];
+  if (mailMode() === "smtp") {
+    for (const table of ["mail_queue", "review_mail"]) {
+      const queued = await one(
+        "SELECT MIN(next_attempt) AS at FROM " +
+          table +
+          " WHERE status='queued'",
+      );
+      if (queued?.at !== null && queued?.at !== undefined)
+        dates.push(Number(queued.at));
+    }
+  }
+  const garbage = await one("SELECT MIN(not_before) AS at FROM file_gc");
+  if (garbage?.at !== null && garbage?.at !== undefined)
+    dates.push(Math.max(Number(garbage.at), Date.now() + 3600000));
+  return dates.length ? Math.min(...dates) : null;
+}
+

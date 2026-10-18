@@ -12,6 +12,8 @@ import {
   type ReactElement,
 } from "react";
 import Link from "next/link";
+import SupportPage from "./Support";
+import { paymentReturnApplication } from "@/lib/payment-return";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowUpRight,
@@ -91,11 +93,19 @@ async function api(url: string, method = "GET", data?: unknown) {
   if (!res.ok) throw new Error(result.error || "処理を完了できませんでした。");
   return result;
 }
-async function upload(file: File, kind: string, conversationId?: string) {
+async function upload(
+  file: File,
+  kind: string,
+  conversationId?: string,
+  ownerId?: string,
+) {
+  if (file.size > 3 * 1024 * 1024)
+    throw new Error("画像・証明書は1ファイル3MB以内にしてください。");
   const form = new FormData();
   form.set("file", file);
   form.set("kind", kind);
   if (conversationId) form.set("conversationId", conversationId);
+  if (ownerId) form.set("ownerId", ownerId);
   const res = await fetch("/api/files", { method: "POST", body: form });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error);
@@ -119,6 +129,7 @@ const STATE_LABELS: Record<string, string> = {
   approved: "承認済み",
   rejected: "不承認",
   draft: "未申請",
+  withdrawn: "取り消し済み",
   paused: "募集休止中",
   suspended: "管理者による掲載停止",
   requested: "会話の申請中",
@@ -507,6 +518,16 @@ export default function App() {
       />
     );
   else if (pathname === "/verify-email") content = <VerifyEmail ctx={ctx} />;
+  else if (pathname === "/contact" || pathname === "/support-admin")
+    content = ready ? (
+      <SupportPage
+        key={pathname + user?.id}
+        user={user}
+        admin={pathname === "/support-admin"}
+      />
+    ) : (
+      <Busy />
+    );
   else if (pathname === "/register")
     content = <Registration key={user?.id || "public"} ctx={ctx} />;
   else if (pathname === "/chat")
@@ -515,6 +536,8 @@ export default function App() {
     ) : (
       <Busy />
     );
+  else if (pathname === "/admin/donors")
+    content = ready ? <AdminDonorEditor ctx={ctx} /> : <Busy />;
   else if (pathname === "/admin")
     content = ready ? (
       <AdminPage key={user?.id || "public"} ctx={ctx} />
@@ -626,6 +649,7 @@ export default function App() {
             <Link href="/terms">利用規約</Link>
             <Link href="/privacy">プライバシー</Link>
             <Link href="/commerce">特定商取引法に基づく表記</Link>
+            <Link href="/contact">お問い合わせ</Link>
           </div>
         </div>
         <div className="footer-bottom">
@@ -1122,7 +1146,7 @@ function Home({ ctx }: { ctx: Context }) {
           {
             question: "利用料金はいくらですか？",
             answer:
-              "提供希望者の登録・利用は無料です。提供者は初回の登録審査と証明書の更新審査に、それぞれ税込5,000円がかかります。同時に複数の証明書を更新する場合は、一括で5,000円です。支払いを確認してから審査を開始します。登録後の定期的な利用料はありません。",
+              "提供希望者の登録・利用は無料です。提供者は初回の登録審査と証明書の更新審査に、それぞれ税込5,000円がかかります。同時更新は一括で5,000円です。原則は管理者による書類照合ですが、入金確認から30日経過した審査待ち・審査中の申請は自動承認・公開されます。差し戻し中・不承認・掲載停止・募集休止・退会済みは対象外です。共通表示の「登録審査完了」は、すべての書類の内容照合を保証する表示ではありません。定期利用料はありません。",
           },
           {
             question: "どの情報が公開されますか？",
@@ -1185,7 +1209,7 @@ function DonorCard({ donor: d }: { donor: Donor }) {
       <div className="card-tags">
         <span className="badge">
           <ShieldCheck size={12} />
-          本人確認済み
+          登録審査完了
         </span>
         {d.recentlyActive && <span className="subtle-tag">最近利用あり</span>}
       </div>
@@ -1580,7 +1604,7 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
           <div className="card-tags">
             <span className="badge">
               <ShieldCheck size={13} />
-              本人確認済み
+              登録審査完了
             </span>
             {d.recentlyActive && (
               <span className="subtle-tag">最近利用あり</span>
@@ -1590,6 +1614,9 @@ function DonorPage({ ctx, donorId }: { ctx: Context; donorId: string }) {
             {d.displayId}
             <span>{d.age}歳</span>
           </h1>
+          <p className="muted">
+            所定の登録手続きを完了し、掲載されています。掲載情報には本人申告や換算による参考値を含みます。
+          </p>
           <p className="location">
             <MapPin size={15} />
             {d.residence}
@@ -1993,29 +2020,12 @@ function RegionEditor({
 function AcademicEditor({
   academic: a,
   onChange,
+  adminMode = false,
 }: {
   academic: Academic;
   onChange: (v: Academic) => void;
+  adminMode?: boolean;
 }) {
-  const [query, setQuery] = useState(""),
-    [entries, setEntries] = useState<any[]>([]);
-  useEffect(() => {
-    if (a.kind === "wais") return;
-    let active = true;
-    const timer = setTimeout(
-      () =>
-        api("catalog?kind=" + a.kind + "&q=" + encodeURIComponent(query))
-          .then((r) => {
-            if (active) setEntries(r.entries);
-          })
-          .catch(() => {}),
-      200,
-    );
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [query, a.kind]);
   if (a.kind === "wais")
     return (
       <Field
@@ -2038,47 +2048,15 @@ function AcademicEditor({
       </Field>
     );
   const manual = (field: string, v: string) =>
-    onChange({ ...a, [field]: v, catalogId: "", deviation: undefined });
+    onChange({
+      ...a,
+      [field]: v,
+      catalogId: "",
+      deviation: undefined,
+      submittedDeviation: a.submittedDeviation ?? a.deviation,
+    });
   return (
     <div className="academic-editor">
-      <Field
-        label="掲載データから学校・学科を検索"
-        note="現在掲載されている年度のデータを使用します。検索欄の文字は公開されません。"
-      >
-        <input
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="学校名・学科名で検索"
-        />
-      </Field>
-      {entries.length > 0 && (
-        <Field label="学校・学科を選択">
-          <select
-            value={a.catalogId}
-            onChange={(e) => {
-              const entry = entries.find((x) => x.id === e.target.value);
-              if (entry)
-                onChange({
-                  ...a,
-                  catalogId: entry.id,
-                  school: entry.school,
-                  faculty: entry.faculty,
-                  department: entry.department,
-                  deviation: entry.deviation,
-                  year: entry.year,
-                });
-            }}
-          >
-            <option value="">選択してください</option>
-            {entries.map((e) => (
-              <option key={e.id} value={e.id}>
-                {e.school} {e.faculty} {e.department}
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
       <div className="form-grid">
         <Field label="学校名" required>
           <input
@@ -2104,9 +2082,39 @@ function AcademicEditor({
             maxLength={120}
           />
         </Field>
+        <Field
+          label={adminMode ? "偏差値（確認済み）" : "偏差値（自己申告）"}
+          note={
+            adminMode
+              ? "確認した学校・学科の偏差値を入力してください。不明な場合は空欄にできます。"
+              : "分かる場合に入力してください。管理者が確認した値をIQの参考値に使用します。"
+          }
+        >
+          <input
+            type="number"
+            min={20}
+            max={90}
+            step="0.1"
+            value={
+              adminMode
+                ? (a.deviation ?? a.submittedDeviation ?? "")
+                : (a.submittedDeviation ?? a.deviation ?? "")
+            }
+            onChange={(e) => {
+              const value =
+                e.target.value === "" ? null : Number(e.target.value);
+              onChange({
+                ...a,
+                catalogId: "",
+                submittedDeviation: value,
+                deviation: adminMode ? value : undefined,
+              });
+            }}
+          />
+        </Field>
       </div>
       <p className="tiny muted">
-        一覧にない学校は、名称を指定して書類を提出できます。偏差値は管理者が指定サイトで照合します。卒業前・中退・海外校は対象外です。学校名は個別開示まで非公開です。
+        学校名・学部・学科は卒業証明書と同じ名称を入力してください。偏差値は管理者が照合します。卒業前・中退・海外校は対象外です。学校名は個別開示まで非公開です。
       </p>
     </div>
   );
@@ -2375,7 +2383,198 @@ function VerifyEmail({ ctx }: { ctx: Context }) {
   );
 }
 
-function Registration({ ctx }: { ctx: Context }) {
+function AdminDonorEditor({ ctx }: { ctx: Context }) {
+  const params = useSearchParams(),
+    router = useRouter();
+  const [created, setCreated] = useState(""),
+    [donors, setDonors] = useState<any[]>([]),
+    [query, setQuery] = useState(""),
+    [email, setEmail] = useState(""),
+    [password, setPassword] = useState(""),
+    [birthDate, setBirthDate] = useState(""),
+    [agreed, setAgreed] = useState(false),
+    [busy, setBusy] = useState(false);
+  const selected = params.get("donor") || created;
+  const load = useCallback(async () => {
+    if (ctx.user?.role !== "admin") return;
+    try {
+      setDonors((await api("admin/donors")).donors);
+    } catch (e) {
+      ctx.notify((e as Error).message);
+    }
+  }, [ctx.user?.role, ctx.notify]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  if (ctx.user?.role !== "admin")
+    return (
+      <div className="page-shell">
+        <Empty title="管理者権限が必要です">
+          管理者アカウントでログインしてください。
+        </Empty>
+      </div>
+    );
+  if (selected)
+    return (
+      <>
+        <div className="page-shell" style={{ paddingBottom: 0 }}>
+          <button
+            className="text-link"
+            onClick={() => {
+              setCreated("");
+              router.push("/admin/donors");
+              void load();
+            }}
+          >
+            別の提供者を選ぶ・新規作成
+          </button>
+        </div>
+        <Registration key={selected} ctx={ctx} adminDonorId={selected} />
+      </>
+    );
+  return (
+    <div className="page-shell">
+      <div className="page-heading">
+        <h1>ドナーの手入力登録・修正</h1>
+        <p>管理者による登録・修正は無料です。何度でも利用できます。</p>
+        <Link className="text-link" href="/admin">
+          管理ページへ戻る
+        </Link>
+      </div>
+      <section className="panel">
+        <h2>登録済みドナーを修正する</h2>
+        <Field label="提供者ID・メールアドレスで検索">
+          <input value={query} onChange={(e) => setQuery(e.target.value)} />
+        </Field>
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>提供者</th>
+                <th>メールアドレス（非公開）</th>
+                <th>状態</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {donors
+                .filter((d) =>
+                  (d.display_id + " " + d.email)
+                    .toLowerCase()
+                    .includes(query.toLowerCase()),
+                )
+                .map((d) => (
+                  <tr key={d.id}>
+                    <td>{d.display_id}</td>
+                    <td>{d.email}</td>
+                    <td>{STATE_LABELS[d.status] || d.status}</td>
+                    <td>
+                      <Link
+                        className="text-link"
+                        href={"/admin/donors?donor=" + encodeURIComponent(d.id)}
+                      >
+                        無料で修正
+                      </Link>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className="panel" style={{ marginTop: 24 }}>
+        <h2>新しいドナーを作成する</h2>
+        <p>
+          ログイン用アカウントを作成した後、通常登録と同じ項目を入力します。管理者のログイン状態は変わりません。
+        </p>
+        <form
+          onSubmit={async (e) => {
+            e.preventDefault();
+            setBusy(true);
+            try {
+              const r = await api("admin/donors", "POST", {
+                email,
+                password,
+                birthDate,
+                agreed,
+              });
+              setPassword("");
+              setCreated(r.user.id);
+              ctx.notify(
+                "無料のドナーアカウントを作成しました。続けて登録情報を入力してください。",
+              );
+            } catch (e) {
+              ctx.notify((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Field label="ドナーのログイン用メールアドレス" required>
+            <input
+              type="email"
+              autoComplete="off"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+            />
+          </Field>
+          <p className="tiny muted">
+            管理者と同じメールアドレスは重複登録できません。別のログイン用アドレスを指定してください。
+          </p>
+          <Field label="ドナーの初期パスワード（10文字以上）" required>
+            <input
+              type="password"
+              minLength={10}
+              maxLength={128}
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+          </Field>
+          <Field label="ドナーの生年月日" required>
+            <input
+              type="date"
+              value={birthDate}
+              onChange={(e) => setBirthDate(e.target.value)}
+              required
+            />
+          </Field>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={agreed}
+              onChange={(e) => setAgreed(e.target.checked)}
+            />
+            <span>
+              登録者本人が
+              <Link href="/terms" target="_blank">
+                利用規約
+              </Link>
+              と
+              <Link href="/privacy" target="_blank">
+                個人情報の取り扱い
+              </Link>
+              に同意していることを確認しました。
+            </span>
+          </label>
+          <button className="button" disabled={busy || !agreed}>
+            無料でドナーを新規作成
+          </button>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function Registration({
+  ctx,
+  adminDonorId,
+}: {
+  ctx: Context;
+  adminDonorId?: string;
+}) {
   const params = useSearchParams();
   const [p, setProfile] = useState<ProfileData>(emptyProfile),
     [approved, setApproved] = useState<ProfileData | null>(null),
@@ -2388,12 +2587,23 @@ function Registration({ ctx }: { ctx: Context }) {
     [busy, setBusy] = useState(false),
     [uploading, setUploading] = useState(""),
     [agreed, setAgreed] = useState(false);
-  const owner = ctx.user?.role === "donor" ? ctx.user.id : null;
+  const adminMode = ctx.user?.role === "admin" && !!adminDonorId;
+  const [managedUser, setManagedUser] = useState<User | null>(null),
+    [adminNote, setAdminNote] = useState("");
+  const owner = adminMode
+    ? adminDonorId!
+    : ctx.user?.role === "donor"
+      ? ctx.user.id
+      : null;
+  const profileRoute = adminMode
+    ? "admin/donors/" + adminDonorId + "/profile"
+    : "profile";
   const load = useCallback(
     async (reset = false) => {
       if (!owner) return;
       try {
-        const r = await api("profile");
+        const r = await api(profileRoute);
+        if (r.user) setManagedUser(r.user);
         if (reset) {
           setProfile(r.profile);
           setDocs(r.documents);
@@ -2406,39 +2616,54 @@ function Registration({ ctx }: { ctx: Context }) {
         ctx.notify((e as Error).message);
       }
     },
-    [owner, ctx.notify],
+    [owner, profileRoute, ctx.notify],
   );
   useEffect(() => {
     if (!owner) return;
     setLoading(true);
     void load(true).finally(() => setLoading(false));
+    if (adminMode) return;
     const timer = setInterval(() => load(false), 10000);
     return () => clearInterval(timer);
-  }, [owner, load]);
+  }, [owner, load, adminMode]);
   const captureOnce = useRef("");
   useEffect(() => {
-    const application = params.get("application");
-    if (
-      !owner ||
-      !application ||
-      !params.get("token") ||
-      captureOnce.current === application
-    )
+    if (!owner || adminMode) return;
+    const marker = "kt_paypal_return:" + owner;
+    if (params.get("cancelled") === "1") {
+      try {
+        sessionStorage.removeItem(marker);
+      } catch {}
       return;
+    }
+    let saved = null;
+    try {
+      saved = sessionStorage.getItem(marker);
+    } catch {}
+    const application = paymentReturnApplication(params, saved);
+    if (!application || captureOnce.current === application) return;
     captureOnce.current = application;
     api("payments/" + application + "/capture", "POST", {})
       .then(() => {
+        try {
+          sessionStorage.removeItem(marker);
+        } catch {}
         ctx.notify("支払いを確認しました。審査待ちになりました。");
         void load(false);
       })
       .catch((e) => ctx.notify(e.message));
-  }, [params, owner, load, ctx.notify]);
+  }, [params, owner, load, ctx.notify, adminMode]);
   const set = (key: keyof ProfileData, v: any) =>
     setProfile((old) => ({ ...old, [key]: v }));
   const attachment = async (file: File, kind: string) => {
     setUploading(kind);
     try {
-      const f = await upload(file, kind);
+      const f = await upload(
+        file,
+        kind,
+        undefined,
+        adminMode ? owner! : undefined,
+      );
       if (kind === "photo") setPhoto(f.id);
       else setDocs((old) => [...old, f]);
       ctx.notify("ファイルを非公開で保存しました。");
@@ -2451,11 +2676,28 @@ function Registration({ ctx }: { ctx: Context }) {
   const save = async (publish = false) => {
     setBusy(true);
     try {
-      await api("profile", "PATCH", { profile: p, publish });
+      await api(profileRoute, "PATCH", {
+        profile: p,
+        publish,
+        ...(adminMode
+          ? {
+              birthDate: managedUser?.birthDate,
+              confirmed: agreed,
+              fileIds: docs.map((f) => f.id),
+              note: adminNote,
+            }
+          : {}),
+      });
       ctx.notify(
-        publish ? "提供条件を更新しました。" : "入力内容を保存しました。",
+        adminMode
+          ? publish
+            ? "料金免除で掲載情報を保存しました。"
+            : "下書きを保存しました。掲載内容は変更していません。"
+          : publish
+            ? "提供条件を更新しました。"
+            : "入力内容を保存しました。",
       );
-      void load(false);
+      await load(adminMode);
     } catch (e) {
       ctx.notify((e as Error).message);
     } finally {
@@ -2497,8 +2739,12 @@ function Registration({ ctx }: { ctx: Context }) {
     setBusy(true);
     try {
       const r = await api("payments/" + a.id + "/" + action, "POST", {});
-      if (r.approveUrl) window.location.assign(r.approveUrl);
-      else {
+      if (r.approveUrl) {
+        try {
+          if (owner) sessionStorage.setItem("kt_paypal_return:" + owner, a.id);
+        } catch {}
+        window.location.assign(r.approveUrl);
+      } else {
         ctx.notify(
           ctx.paymentMode === "demo"
             ? "デモ支払いを確認しました。実際の課金はありません。"
@@ -2520,7 +2766,7 @@ function Registration({ ctx }: { ctx: Context }) {
           <FileText size={19} />
           <span>
             {DOC_LABELS[kind]}
-            {required && <b className="required">必須</b>}
+            {required && !adminMode && <b className="required">必須</b>}
           </span>
         </div>
         {files.map((f) => (
@@ -2567,7 +2813,7 @@ function Registration({ ctx }: { ctx: Context }) {
       </div>
     );
   };
-  if (ctx.user && ctx.user.role !== "donor")
+  if (ctx.user && ctx.user.role !== "donor" && !adminMode)
     return (
       <div className="page-shell">
         <Empty
@@ -2596,7 +2842,13 @@ function Registration({ ctx }: { ctx: Context }) {
       </div>
       <div className="page-heading">
         <span className="eyebrow">BECOME A DONOR</span>
-        <h1>{approved ? "登録情報を管理する" : "提供者として、登録する。"}</h1>
+        <h1>
+          {adminMode
+            ? "ドナーの手入力登録・修正（無料）"
+            : approved
+              ? "登録情報を管理する"
+              : "提供者として、登録する。"}
+        </h1>
         <p>情報はひとつずつ確認し、公開します。顔写真・学歴は個別開示です。</p>
       </div>
       {!ctx.user && (
@@ -2620,7 +2872,7 @@ function Registration({ ctx }: { ctx: Context }) {
         <Busy />
       ) : (
         <>
-          {approved && (
+          {approved && !adminMode && (
             <div className="status-banner">
               <div>
                 <CheckCircle2 size={21} />
@@ -2656,7 +2908,7 @@ function Registration({ ctx }: { ctx: Context }) {
               </button>
             </div>
           )}
-          {pending && (
+          {pending && !adminMode && (
             <div className="panel payment-panel">
               <div>
                 <span className="badge">{STATE_LABELS[pending.status]}</span>
@@ -2666,7 +2918,7 @@ function Registration({ ctx }: { ctx: Context }) {
                 <p>
                   {pending.status === "payment_pending"
                     ? "支払い完了後に審査を開始します。掲載の承認は保証されません。"
-                    : "支払いを確認しています。管理者の審査をお待ちください。"}
+                    : "入金確認済みです。原則は管理者が審査し、30日後に自動承認・公開します。差し戻し・不承認・休止・停止・退会は対象外です。"}
                 </p>
               </div>
               {pending.status === "payment_pending" && (
@@ -2758,12 +3010,19 @@ function Registration({ ctx }: { ctx: Context }) {
                 ),
               )}
               <div className="registration-fee">
-                <small>登録・証明書更新の審査料</small>
+                <small>
+                  {adminMode
+                    ? "管理者による登録・修正"
+                    : "登録・証明書更新の審査料"}
+                </small>
                 <strong>
-                  ¥5,000<span>税込</span>
+                  {adminMode ? "無料" : "¥5,000"}
+                  <span>{adminMode ? "料金免除" : "税込"}</span>
                 </strong>
                 <p>
-                  同時に提出する更新書類は一括料金です。審査開始前の支払いが必要です。
+                  {adminMode
+                    ? "何度でも登録・修正できます。下書き保存では現在の掲載内容は変わりません。"
+                    : "同時に提出する更新書類は一括料金です。審査開始前の支払いが必要です。"}
                 </p>
               </div>
             </aside>
@@ -2784,7 +3043,36 @@ function Registration({ ctx }: { ctx: Context }) {
                 </div>
                 {step === 0 && (
                   <>
-                    <ContactSettings ctx={ctx} />
+                    {adminMode ? (
+                      <>
+                        <p>
+                          対象：{managedUser?.displayId}（
+                          {STATE_LABELS[status] || status}）
+                        </p>
+                        <Field label="ログイン用メールアドレス（非公開）">
+                          <input value={managedUser?.email || ""} readOnly />
+                        </Field>
+                        <Field
+                          label="ドナーの生年月日"
+                          required
+                          note="生年月日の変更は「掲載・更新」時に反映されます。"
+                        >
+                          <input
+                            type="date"
+                            value={managedUser?.birthDate || ""}
+                            onChange={(e) =>
+                              setManagedUser((old) =>
+                                old
+                                  ? { ...old, birthDate: e.target.value }
+                                  : old,
+                              )
+                            }
+                          />
+                        </Field>
+                      </>
+                    ) : (
+                      <ContactSettings ctx={ctx} />
+                    )}
                     <div className="form-grid">
                       <Field label="身長" required>
                         <div className="input-unit">
@@ -2828,7 +3116,11 @@ function Registration({ ctx }: { ctx: Context }) {
                       </Field>
                       <SkeletalInput
                         p={p}
-                        birthDate={ctx.user?.birthDate || ""}
+                        birthDate={
+                          (adminMode
+                            ? managedUser?.birthDate
+                            : ctx.user?.birthDate) || ""
+                        }
                         onChange={(patch) =>
                           setProfile((old) => ({ ...old, ...patch }))
                         }
@@ -2953,6 +3245,7 @@ function Registration({ ctx }: { ctx: Context }) {
                         </h4>
                         <AcademicEditor
                           academic={a}
+                          adminMode={adminMode}
                           onChange={(v) =>
                             set(
                               "academics",
@@ -3288,14 +3581,26 @@ function Registration({ ctx }: { ctx: Context }) {
                       <div>
                         <FileCheck2 size={29} />
                         <span>
-                          {approved ? "証明書更新審査" : "提供者登録審査"}
+                          {adminMode
+                            ? "管理者による掲載・更新"
+                            : approved
+                              ? "証明書更新審査"
+                              : "提供者登録審査"}
                         </span>
                         <strong>
-                          ¥5,000<small>税込</small>
+                          {adminMode ? (
+                            "無料"
+                          ) : (
+                            <>
+                              ¥5,000<small>税込</small>
+                            </>
+                          )}
                         </strong>
                       </div>
                       <p>
-                        同時に提出する書類は一括料金です。支払い完了後に審査を開始します。不承認・自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。
+                        {adminMode
+                          ? "本人確認・証明情報の照合と掲載への同意を確認した上で公開してください。決済は発生せず、何度でも登録・修正できます。書類は必要に応じて添付でき、掲載時に証明書原本を削除します。"
+                          : "同時に提出する書類は一括料金です。支払い完了後に審査を開始します。入金確認から30日経過した審査待ち・審査中の申請は自動承認・公開します。差し戻し・不承認・休止・停止・退会は対象外です。不承認・自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。"}
                       </p>
                     </div>
                     <dl className="definition-list">
@@ -3316,6 +3621,17 @@ function Registration({ ctx }: { ctx: Context }) {
                         </dd>
                       </div>
                     </dl>
+                    {adminMode && (
+                      <>
+                        <Field label="管理者メモ（任意・一般非公開）">
+                          <textarea
+                            maxLength={500}
+                            value={adminNote}
+                            onChange={(e) => setAdminNote(e.target.value)}
+                          />
+                        </Field>
+                      </>
+                    )}
                     <label className="check-row">
                       <input
                         type="checkbox"
@@ -3323,7 +3639,9 @@ function Registration({ ctx }: { ctx: Context }) {
                         onChange={(e) => setAgreed(e.target.checked)}
                       />
                       <span>
-                        公開範囲、審査料、
+                        {adminMode
+                          ? "本人確認・証明情報の照合、本人の掲載への同意、公開範囲、"
+                          : "公開範囲、審査料、"}
                         <Link href="/terms" target="_blank">
                           利用規約
                         </Link>
@@ -3333,21 +3651,28 @@ function Registration({ ctx }: { ctx: Context }) {
                     <button
                       className="button full-width"
                       disabled={
-                        !owner || busy || !!pending || !agreed || !!uploading
+                        !owner ||
+                        busy ||
+                        (!adminMode && !!pending) ||
+                        (adminMode && !managedUser) ||
+                        !agreed ||
+                        !!uploading
                       }
-                      onClick={submit}
+                      onClick={adminMode ? () => save(true) : submit}
                     >
                       {busy ? (
                         <LoaderCircle size={16} className="spin" />
                       ) : (
                         <FileCheck2 size={17} />
                       )}{" "}
-                      {applications.some((a) => a.status === "needs_changes")
-                        ? "修正して再提出（追加料金なし）"
-                        : "申請して支払いへ"}
+                      {adminMode
+                        ? "無料で掲載・更新する"
+                        : applications.some((a) => a.status === "needs_changes")
+                          ? "修正して再提出（追加料金なし）"
+                          : "申請して支払いへ"}
                       <ArrowRight size={17} />
                     </button>
-                    {approved && (
+                    {!adminMode && approved && (
                       <button
                         className="button button-outline full-width free-update"
                         disabled={busy || !owner}
@@ -3413,7 +3738,13 @@ function Registration({ ctx }: { ctx: Context }) {
                   <span className="badge neutral">
                     {STATE_LABELS[a.status]}
                   </span>
-                  <small>{a.paid ? "支払い済み" : "未払い"}</small>
+                  <small>
+                    {a.paid
+                      ? "支払い済み"
+                      : a.approval_method === "admin_entry"
+                        ? "料金免除"
+                        : "未払い"}
+                  </small>
                 </div>
               ))}
             </section>
@@ -4043,10 +4374,12 @@ function AdminPage({ ctx }: { ctx: Context }) {
         confirmed,
         reason,
         academicDeviations: Object.fromEntries(
-          Object.entries(deviations).map(([k, v]) => [
-            k,
-            v === "" ? null : Number(v),
-          ]),
+          selected.profile.academics
+            .filter((a: Academic) => a.kind !== "wais")
+            .map((a: Academic) => {
+              const v = deviations[a.kind] ?? a.submittedDeviation;
+              return [a.kind, v === "" || v == null ? null : Number(v)];
+            }),
         ),
       });
       ctx.notify(
@@ -4076,6 +4409,31 @@ function AdminPage({ ctx }: { ctx: Context }) {
       <div className="page-heading">
         <span className="eyebrow">ADMINISTRATION</span>
         <h1>管理ページ</h1>
+        <Link href="/admin/donors" className="button">
+          ドナーを手入力登録（無料）
+        </Link>
+        <Link href="/support-admin" className="button secondary">
+          問い合わせ管理
+        </Link>
+        <button
+          className="button secondary"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await api("admin/mail-test", "POST", {});
+              ctx.notify(
+                "運営者の受信アドレスへテストメールを送信しました。受信箱を確認してください。",
+              );
+            } catch (e) {
+              ctx.notify((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          運営宛にテストメール
+        </button>
         <p>書類を照合し、登録・証明書更新を判断します。</p>
       </div>
       <div className="admin-stats">
@@ -4161,6 +4519,8 @@ function AdminPage({ ctx }: { ctx: Context }) {
                             <Check size={13} />
                             5,000円
                           </span>
+                        ) : a.approval_method === "admin_entry" ? (
+                          "料金免除"
                         ) : (
                           "未払い"
                         )}
@@ -4207,6 +4567,12 @@ function AdminPage({ ctx }: { ctx: Context }) {
                     <td>{d.display_id}</td>
                     <td>{STATE_LABELS[d.status]}</td>
                     <td>
+                      <Link
+                        className="text-link"
+                        href={"/admin/donors?donor=" + encodeURIComponent(d.id)}
+                      >
+                        情報を修正（無料）
+                      </Link>{" "}
                       {["approved", "paused", "suspended"].includes(
                         d.status,
                       ) && (
@@ -4261,10 +4627,46 @@ function AdminPage({ ctx }: { ctx: Context }) {
               {STATE_LABELS[selected.status]}
             </span>
             <span>
-              {selected.paid ? "審査料の支払い済み" : "未払い・審査開始不可"}
+              {selected.paid
+                ? "審査料の支払い済み"
+                : selected.approval_method === "admin_entry"
+                  ? "料金免除（管理者入力）"
+                  : "未払い・審査開始不可"}
             </span>
           </div>
           <dl className="definition-list">
+            <div>
+              <dt>入金確認・承認</dt>
+              <dd>
+                {selected.paid_at || "未入金"} /{" "}
+                {selected.approval_method === "automatic"
+                  ? "期限経過による自動承認"
+                  : selected.approval_method === "manual"
+                    ? "管理者による承認"
+                    : selected.approval_method === "admin_entry"
+                      ? "管理者による手入力・料金免除"
+                      : "未承認"}
+                {selected.decided_at ? `（${selected.decided_at}）` : ""}
+              </dd>
+            </div>
+            <div>
+              <dt>審査通知</dt>
+              <dd>
+                {(
+                  {
+                    preview: "デモ受信欄（実送信なし）",
+                    queued: "送信待ち",
+                    sent: "送信済み",
+                    failed: "送信失敗・SMTP設定を確認してください",
+                  } as Record<string, string>
+                )[selected.reviewMail?.status] || "未作成"}
+                {selected.reviewMail?.status === "preview" && (
+                  <pre style={{ whiteSpace: "pre-wrap" }}>
+                    {selected.reviewMail.body}
+                  </pre>
+                )}
+              </dd>
+            </div>
             <div>
               <dt>生年月日</dt>
               <dd>{selected.birth_date}</dd>
@@ -4331,7 +4733,7 @@ function AdminPage({ ctx }: { ctx: Context }) {
                   note={
                     a.deviation
                       ? "掲載データから取得済み。学校・学科の一致を確認してください。"
-                      : "現在掲載されている学科の最大値を照合。取得できない場合は空欄。"
+                      : `申告値：${a.submittedDeviation ?? "未入力"}。学校・学科の偏差値を照合し、必要なら修正してください。不明なら空欄。`
                   }
                 >
                   <input
@@ -4340,7 +4742,12 @@ function AdminPage({ ctx }: { ctx: Context }) {
                     min={20}
                     max={90}
                     disabled={!!a.deviation}
-                    value={a.deviation ?? deviations[a.kind] ?? ""}
+                    value={
+                      a.deviation ??
+                      deviations[a.kind] ??
+                      a.submittedDeviation ??
+                      ""
+                    }
                     onChange={(e) =>
                       setDeviations((old) => ({
                         ...old,
@@ -4493,6 +4900,20 @@ function AdminPage({ ctx }: { ctx: Context }) {
   );
 }
 function LegalPage({ page }: { page: string }) {
+  const [operator, setOperator] = useState({
+    name: "",
+    address: "",
+    phone: "",
+    type: "individual",
+    representative: "",
+    mode: "on_request",
+    disclosureReady: false,
+  });
+  useEffect(() => {
+    api("public-config")
+      .then((result) => setOperator(result.operator))
+      .catch(() => {});
+  }, []);
   const title =
     page === "/terms"
       ? "利用規約"
@@ -4513,6 +4934,9 @@ function LegalPage({ page }: { page: string }) {
               日本国内向け、18歳以上の方が対象です。個人間の精子提供について情報を確認し、対話する場を提供します。運営による医療サービス・提供の実施・結果の保証はありません。
             </p>
             <h2>登録・審査料</h2>
+            <p>
+              原則は管理者による書類照合です。入金確認日時から30日を経過した審査待ち・審査中の申請は、期限経過により自動承認・公開されます。差し戻し中、不承認、掲載停止、募集休止、退会済みは対象外です。どちらの承認も「登録審査完了」と表示します。所定の登録手続きを完了し、掲載されています。掲載情報には本人申告や換算による参考値を含みます。この表示は、すべての書類の内容照合や情報の正確性を保証するものではありません。
+            </p>
             <p>
               希望者は無料。提供者の登録と証明書更新は、審査開始前に税込5,000円を支払います。同時更新は一括料金です。不承認や自己都合退会による返金はありません。同一申請の差し戻し修正に追加料金はかかりません。二重決済やシステム起因の誤請求は運営が個別確認します。
             </p>
@@ -4552,6 +4976,9 @@ function LegalPage({ page }: { page: string }) {
             </p>
             <h2>削除と決済</h2>
             <p>
+              お問い合わせ内容と運営の返信は、受付・対応のためサイト内に保存し、本人と管理者が閲覧できます。ログインせずに送信した場合は専用リンクを知る人が閲覧できます。リンクと直近10件の受付履歴はこのブラウザーにも保存します。問い合わせ画面から削除できます。ログイン中に作成した問い合わせは退会時にも削除します。
+            </p>
+            <p>
               退会時にサイト本体の情報を削除します。バックアップを利用する公開環境では、その保存期限と削除手順を事前に案内します。決済事業者が保持する取引記録、利用者自身が取得・保存した情報は、サイト側から削除できません。
             </p>
             <h2>Cookie</h2>
@@ -4561,20 +4988,71 @@ function LegalPage({ page }: { page: string }) {
           </>
         ) : (
           <>
-            <div className="notice">
-              <AlertCircle size={21} />
-              <p>
-                運営者情報は未設定です。本番で受付を開始する前に、運営者と連絡先等を設定してください。
-              </p>
-            </div>
+            {(operator.mode === "on_request"
+              ? !operator.disclosureReady
+              : !operator.name || !operator.address || !operator.phone) && (
+              <div className="notice">
+                <AlertCircle size={21} />
+                <p>
+                  運営者情報は未設定です。本番で受付を開始する前に、運営者と連絡先等を設定してください。
+                </p>
+              </div>
+            )}
             <dl className="definition-list">
               <div>
                 <dt>サービス名</dt>
                 <dd>コウノトリのつばさ</dd>
               </div>
               <div>
-                <dt>運営者・住所・連絡先</dt>
-                <dd>公開前に設定</dd>
+                <dt>運営者</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? `請求時に開示（${operator.type === "company" ? "法人運営" : "個人運営"}）`
+                    : operator.name || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>運営責任者</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.representative ||
+                      operator.name ||
+                      "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>所在地</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.address || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>電話番号</dt>
+                <dd>
+                  {operator.mode === "on_request"
+                    ? "請求時に開示"
+                    : operator.phone || "公開前に設定"}
+                </dd>
+              </div>
+              <div>
+                <dt>運営者情報の開示請求</dt>
+                <dd>
+                  {operator.disclosureReady
+                    ? "氏名・住所・電話番号は、請求があった場合、申込みの意思決定に先立って十分な時間的余裕をもって、書面または電子メール等で遅滞なく提供します。"
+                    : "開示のための情報と対応手順を準備中です。本番受付はまだ開始していません。"}{" "}
+                  <Link href="/contact">お問い合わせフォーム</Link>
+                  で「運営者情報の開示請求」を選択してください。
+                </dd>
+              </div>
+              <div>
+                <dt>お問い合わせ</dt>
+                <dd>
+                  <Link href="/contact">お問い合わせフォーム</Link>
+                  から受け付け、原則サイト内で返信します。
+                </dd>
               </div>
               <div>
                 <dt>販売価格</dt>
@@ -4611,3 +5089,4 @@ function LegalPage({ page }: { page: string }) {
     </div>
   );
 }
+
