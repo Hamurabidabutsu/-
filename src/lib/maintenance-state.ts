@@ -1,6 +1,7 @@
 import { getStore } from "@netlify/blobs";
 import { randomUUID } from "node:crypto";
 import { remoteStorage } from "./storage";
+import { blobFetch } from "./blob-fetch";
 
 const stateStore = () =>
   getStore({
@@ -9,12 +10,7 @@ const stateStore = () =>
         ? "maintenance-state-demo"
         : "maintenance-state",
     consistency: "strong",
-    fetch: async (input, init) => {
-      const response = await fetch(input, init);
-      if (!response.ok && response.status !== 404)
-        console.warn("Maintenance storage HTTP", init?.method, response.status);
-      return response;
-    },
+    fetch: blobFetch,
   });
 export async function maintenanceState() {
   if (!remoteStorage()) return null;

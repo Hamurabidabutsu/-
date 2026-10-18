@@ -26,6 +26,7 @@ import {
   finishMaintenance,
 } from "../src/lib/maintenance-state";
 import { putUpload, readUpload } from "../src/lib/uploads";
+import { blobFetch } from "../src/lib/blob-fetch";
 import { emptyProfile } from "../src/lib/shared";
 import scheduled from "../netlify/functions/maintenance.mjs";
 
@@ -179,6 +180,23 @@ async function call(
     cookie: response.headers.get("set-cookie")?.split(";")[0] || cookie,
   };
 }
+
+test("Blobs bypass framework fetch in the Netlify runtime", async () => {
+  const patchedFetch = globalThis.fetch;
+  const previousRuntime = process.env.NETLIFY;
+  try {
+    process.env.NETLIFY = "true";
+    globalThis.fetch = async () => {
+      throw new Error("Framework fetch must not handle private blob requests");
+    };
+    const store = getStore({ name: "transport-regression", consistency: "strong", fetch: blobFetch });
+    assert.equal(await store.get("missing", { type: "json" }), null);
+  } finally {
+    globalThis.fetch = patchedFetch;
+    if (previousRuntime === undefined) delete process.env.NETLIFY;
+    else process.env.NETLIFY = previousRuntime;
+  }
+});
 
 test("PostgreSQL: parameter binding, transaction rollback and concurrent commits", async () => {
   assert.equal(

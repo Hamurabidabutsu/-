@@ -2,6 +2,7 @@ import { getStore } from "@netlify/blobs";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { dataDir, remoteStorage } from "./storage";
+import { blobFetch } from "./blob-fetch";
 
 const store = () =>
   getStore({
@@ -10,6 +11,7 @@ const store = () =>
         ? "private-uploads-demo"
         : "private-uploads",
     consistency: "strong",
+    fetch: blobFetch,
   });
 function localPath(key: string) {
   if (!/^[a-zA-Z0-9_.-]+$/.test(key)) throw new Error("Invalid storage key");
