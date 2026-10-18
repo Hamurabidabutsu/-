@@ -1,4 +1,5 @@
 import { runWorkflow } from "./helpers/workflow-scenario";
+import { runAdminEntry } from "./helpers/admin-entry-scenario";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
@@ -181,6 +182,129 @@ async function call(
   };
 }
 
+test("PostgreSQL: reusable free administrator entry, payment repair and private documents", async () => {
+  const { admin, created, second, route, entry, login } =
+    await runAdminEntry(call);
+  const stored = await one(
+    "SELECT * FROM applications WHERE user_id=?",
+    created.user.id,
+  );
+  assert.equal(stored!.payment_ref, null);
+  assert.equal(stored!.paypal_order, null);
+  assert.notEqual(
+    (await one("SELECT password_hash FROM users WHERE id=?", created.user.id))!
+      .password_hash,
+    "Manual-test-password123!",
+  );
+  const targetRoute = `admin/donors/${second.user.id}/profile`;
+  const time = new Date().toISOString();
+  await run(
+    "INSERT INTO applications(id,user_id,kind,data_json,status,paid,paypal_order,created_at) VALUES(?,?,?,?,?,?,?,?)",
+    "manual-payment",
+    second.user.id,
+    "initial",
+    JSON.stringify(entry.profile),
+    "payment_pending",
+    0,
+    "INFLIGHT",
+    time,
+  );
+  await call(targetRoute, "PATCH", entry, admin.cookie, 409);
+  assert.equal(
+    (await call(targetRoute, "GET", undefined, admin.cookie)).user.birthDate,
+    "1990-01-01",
+  );
+  await call(targetRoute, "PATCH", { ...entry, publish: false }, admin.cookie);
+  await run(
+    "UPDATE applications SET paid=1,payment_ref=?,paid_at=?,status='queued' WHERE id=?",
+    "PRESERVED-CAPTURE",
+    time,
+    "manual-payment",
+  );
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADElEQVQImWP48OEDAAWkAtEPcc/YAAAAAElFTkSuQmCC",
+    "base64",
+  );
+  const requestUpload = async (
+    ownerId: string,
+    cookie: string,
+    kind: string,
+    expected: number,
+  ) => {
+    const form = new FormData();
+    form.set("ownerId", ownerId);
+    form.set("kind", kind);
+    form.set("file", new Blob([png], { type: "image/png" }), "synthetic.png");
+    const response = await handle(
+      new Request("http://localhost:3000/api/files", {
+        method: "POST",
+        headers: { Origin: "http://localhost:3000", Cookie: cookie },
+        body: form,
+      }),
+      ["files"],
+    );
+    const result = await response.json();
+    assert.equal(response.status, expected, JSON.stringify(result));
+    return result;
+  };
+  await requestUpload(second.user.id, login.cookie, "identity", 403);
+  await requestUpload(admin.user.id, admin.cookie, "identity", 404);
+  await requestUpload(second.user.id, admin.cookie, "chat", 403);
+  const doc = (
+    await requestUpload(second.user.id, admin.cookie, "identity", 201)
+  ).file;
+  assert.equal(
+    (await one("SELECT owner_id FROM files WHERE id=?", doc.id))!.owner_id,
+    second.user.id,
+  );
+  await call(
+    targetRoute,
+    "PATCH",
+    { ...entry, fileIds: [doc.id] },
+    admin.cookie,
+  );
+  assert.equal(await one("SELECT id FROM files WHERE id=?", doc.id), undefined);
+  const repaired = (await one(
+    "SELECT * FROM applications WHERE id=?",
+    "manual-payment",
+  ))!;
+  assert.equal(repaired.status, "approved");
+  assert.equal(repaired.paid, 1);
+  assert.equal(repaired.payment_ref, "PRESERVED-CAPTURE");
+  assert.equal(repaired.paid_at, time);
+  assert.equal(repaired.approval_method, "admin_entry");
+  await run(
+    "INSERT INTO applications(id,user_id,kind,data_json,status,paid,created_at) VALUES(?,?,?,?,?,?,?)",
+    "manual-unpaid",
+    second.user.id,
+    "update",
+    JSON.stringify(entry.profile),
+    "payment_pending",
+    0,
+    time,
+  );
+  await call(targetRoute, "PATCH", entry, admin.cookie);
+  assert.equal(
+    (await one("SELECT status FROM applications WHERE id=?", "manual-unpaid"))!
+      .status,
+    "withdrawn",
+  );
+  const publicProfile = await call("donors/" + second.user.id);
+  assert.equal(publicProfile.donor.email, undefined);
+  assert.equal(publicProfile.donor.birthDate, undefined);
+  const photo = (
+    await requestUpload(second.user.id, admin.cookie, "photo", 201)
+  ).file;
+  await call("files/" + photo.id, "DELETE", undefined, admin.cookie);
+  assert.equal(
+    (await one(
+      "SELECT photo_id FROM profiles WHERE user_id=?",
+      second.user.id,
+    ))!.photo_id,
+    null,
+  );
+});
+
 test("Blobs bypass framework fetch in the Netlify runtime", async () => {
   const patchedFetch = globalThis.fetch;
   const previousRuntime = process.env.NETLIFY;
@@ -207,7 +331,13 @@ test("Only an administrator can send an operator mail test", async () => {
   const recipient = await call("auth/demo", "POST", { role: "recipient" });
   await call("admin/mail-test", "POST", {}, recipient.cookie, 403);
   const admin = await call("auth/demo", "POST", { role: "admin" });
-  await call("admin/mail-test", "POST", { to: "untrusted@example.test" }, admin.cookie, 503);
+  await call(
+    "admin/mail-test",
+    "POST",
+    { to: "untrusted@example.test" },
+    admin.cookie,
+    503,
+  );
 });
 
 test("PostgreSQL: parameter binding, transaction rollback and concurrent commits", async () => {

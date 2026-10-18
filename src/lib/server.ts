@@ -1635,10 +1635,67 @@ async function handleRequest(req: Request, parts: string[]) {
         fail(404, "提供者が見つかりません。");
       return json({ donor: await donor(r, u) });
     }
-    if (key === "profile" && method === "GET") {
-      const u = await needUser(req, "donor"),
-        p = (await one("SELECT * FROM profiles WHERE user_id=?", u.id))!;
+    const managedProfile =
+      parts[0] === "admin" &&
+      parts[1] === "donors" &&
+      parts.length === 4 &&
+      parts[3] === "profile";
+    if (key === "admin/donors" && method === "POST") {
+      await needUser(req, "admin");
+      const b = await body(req),
+        email = text(b.email, 254).toLowerCase(),
+        password = text(b.password, 128),
+        birth = date(b.birthDate, true);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+        fail(400, "メールアドレスを確認してください。");
+      if (password.length < 10)
+        fail(400, "パスワードは10文字以上で設定してください。");
+      if (ageOf(birth) < 18) fail(400, "18歳以上の方のみ登録できます。");
+      if (b.agreed !== true) fail(400, "登録者本人の同意を確認してください。");
+      const uid = id();
+      await transaction(async () => {
+        if (await one("SELECT id FROM users WHERE email=?", email))
+          fail(
+            409,
+            "このメールアドレスは登録済みです。既存のドナーを選ぶか、別のログイン用メールアドレスを指定してください。",
+          );
+        await run(
+          "INSERT INTO users(id,email,password_hash,role,birth_date,display_id,created_at,last_active) VALUES(?,?,?,?,?,?,?,?)",
+          uid,
+          email,
+          passwordHash(password),
+          "donor",
+          birth,
+          "D-" + randomBytes(3).toString("hex").toUpperCase(),
+          now(),
+          now(),
+        );
+        await run(
+          "INSERT INTO profiles VALUES(?,?,?,?,?,NULL)",
+          uid,
+          "draft",
+          JSON.stringify(emptyProfile()),
+          null,
+          0,
+        );
+      });
+      const created = (await one("SELECT * FROM users WHERE id=?", uid))!;
+      if (mailMode() !== "unconfigured") await verifyEmail(created);
+      return json({ user: publicUser(created) }, 201);
+    }
+    if ((key === "profile" || managedProfile) && method === "GET") {
+      let u: Row;
+      if (managedProfile) {
+        await needUser(req, "admin");
+        u = (await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          parts[2],
+        ))!;
+        if (!u) fail(404, "提供者が見つかりません。");
+      } else u = await needUser(req, "donor");
+      const p = (await one("SELECT * FROM profiles WHERE user_id=?", u.id))!;
       return json({
+        ...(managedProfile ? { user: publicUser(u) } : {}),
         profile: normalizeProfile(JSON.parse(p.data_json)),
         approved: p.approved_json
           ? normalizeProfile(JSON.parse(p.approved_json))
@@ -1651,10 +1708,134 @@ async function handleRequest(req: Request, parts: string[]) {
           u.id,
         ),
         applications: await all(
-          "SELECT id,kind,status,paid,created_at,review_reason FROM applications WHERE user_id=? ORDER BY created_at DESC",
+          "SELECT id,kind,status,paid,created_at,review_reason,approval_method FROM applications WHERE user_id=? ORDER BY created_at DESC",
           u.id,
         ),
       });
+    }
+    if (managedProfile && method === "PATCH") {
+      await needUser(req, "admin");
+      const b = await body(req),
+        uid = parts[2];
+      await transaction(async () => {
+        const u = await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          uid,
+        );
+        if (!u) fail(404, "提供者が見つかりません。");
+        const current = (await one(
+          "SELECT * FROM profiles WHERE user_id=?",
+          uid,
+        ))!;
+        const birth = date(b.birthDate || u.birth_date, true);
+        if (ageOf(birth) < 18) fail(400, "18歳以上の方のみ登録できます。");
+        const p = await profileData(
+          b.profile,
+          current.approved_json ? JSON.parse(current.approved_json) : undefined,
+          birth,
+        );
+        for (const a of p.academics) {
+          const input = b.profile.academics.find((x: Row) => x.kind === a.kind);
+          if (
+            a.kind !== "wais" &&
+            !a.catalogId &&
+            input &&
+            Object.hasOwn(input, "deviation")
+          ) {
+            if (input.deviation === null) delete a.deviation;
+            else
+              a.deviation = numeric(input.deviation, 20, 90, "照合した偏差値")!;
+          }
+        }
+        if (b.publish !== true) {
+          await run(
+            "UPDATE profiles SET data_json=? WHERE user_id=?",
+            JSON.stringify(p),
+            uid,
+          );
+          return;
+        }
+        if (b.confirmed !== true)
+          fail(
+            400,
+            "本人確認・証明情報の照合と掲載への同意を確認してください。",
+          );
+        await run("UPDATE users SET birth_date=? WHERE id=?", birth, uid);
+        const active = await all(
+          "SELECT * FROM applications WHERE user_id=? AND status IN ('payment_pending','queued','reviewing','needs_changes')",
+          uid,
+        );
+        if (active.some((a) => !a.paid && a.paypal_order))
+          fail(
+            409,
+            "PayPalの決済手続きが進行中です。先に支払い状態を確認してください。入力内容は下書き保存できます。",
+          );
+        if (
+          !Array.isArray(b.fileIds) ||
+          b.fileIds.length > 16 ||
+          new Set(b.fileIds).size !== b.fileIds.length
+        )
+          fail(400, "提出書類を確認してください。");
+        const files = [];
+        for (const fid of b.fileIds) {
+          const f = await one(
+            "SELECT * FROM files WHERE id=? AND owner_id=? AND application_id IS NULL AND conversation_id IS NULL",
+            fid,
+            uid,
+          );
+          if (!f || !DOC_LABELS[f.kind])
+            fail(400, "提出書類を確認してください。");
+          files.push(f);
+        }
+        const paidApplication = active.find((a) => a.paid),
+          aid = paidApplication?.id || id();
+        const note =
+          "管理者による手入力・追加料金なし" +
+          (b.note ? "：" + text(b.note, 500) : "");
+        if (paidApplication) {
+          await run(
+            "UPDATE applications SET status='approved',data_json=?,approval_method='admin_entry',decided_at=?,review_reason=? WHERE id=?",
+            JSON.stringify(p),
+            now(),
+            note,
+            aid,
+          );
+        } else {
+          await run(
+            "INSERT INTO applications(id,user_id,kind,data_json,status,paid,created_at,decided_at,approval_method,review_reason) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            aid,
+            uid,
+            current.approved_json ? "update" : "initial",
+            JSON.stringify(p),
+            "approved",
+            0,
+            now(),
+            now(),
+            "admin_entry",
+            note,
+          );
+        }
+        for (const a of active)
+          if (a.id !== aid) {
+            await run(
+              "UPDATE applications SET status='withdrawn',review_reason=? WHERE id=?",
+              "管理者入力による置き換え（料金免除）",
+              a.id,
+            );
+            await deleteDocuments(a.id);
+          }
+        for (const f of files)
+          await run("UPDATE files SET application_id=? WHERE id=?", aid, f.id);
+        await run(
+          "UPDATE profiles SET data_json=?,approved_json=?,status='approved',verified=1 WHERE user_id=?",
+          JSON.stringify(p),
+          JSON.stringify(p),
+          uid,
+        );
+        await deleteDocuments(aid);
+      });
+      await cleanFiles();
+      return json({ ok: true, feeWaived: true });
     }
     if (key === "profile" && method === "PATCH") {
       const u = await needUser(req, "donor"),
@@ -1918,15 +2099,27 @@ async function handleRequest(req: Request, parts: string[]) {
       }
     }
     if (key === "files" && method === "POST") {
-      const u = await needUser(req),
-        raw = await bounded(req, 4 * 1024 * 1024),
+      let u = await needUser(req);
+      const raw = await bounded(req, 4 * 1024 * 1024),
         form = await new Request(req.url, {
           method: "POST",
           headers: { "Content-Type": req.headers.get("content-type") || "" },
           body: raw,
         }).formData();
+      const managedOwner = form.get("ownerId");
+      if (managedOwner) {
+        if (u.role !== "admin") fail(403, "管理者権限が必要です。");
+        const target = await one(
+          "SELECT * FROM users WHERE id=? AND role='donor'",
+          text(managedOwner, 100),
+        );
+        if (!target) fail(404, "提供者が見つかりません。");
+        u = target;
+      }
       const kind = String(form.get("kind") || ""),
         chatId = String(form.get("conversationId") || "");
+      if (managedOwner && kind === "chat")
+        fail(403, "代理登録ではプロフィール書類のみアップロードできます。");
       if (![...Object.keys(DOC_LABELS), "photo", "chat"].includes(kind))
         fail(400, "書類の種類を選択してください。");
       if (kind !== "chat" && u.role !== "donor")
@@ -2057,7 +2250,7 @@ async function handleRequest(req: Request, parts: string[]) {
       }
       if (method === "DELETE") {
         if (
-          file.owner_id !== u.id ||
+          (file.owner_id !== u.id && u.role !== "admin") ||
           file.application_id ||
           (file.kind === "chat" &&
             (await one("SELECT id FROM messages WHERE file_id=?", file.id)))
@@ -2069,7 +2262,10 @@ async function handleRequest(req: Request, parts: string[]) {
         );
         await run("DELETE FROM files WHERE id=?", file.id);
         if (file.kind === "photo")
-          await run("UPDATE profiles SET photo_id=NULL WHERE user_id=?", u.id);
+          await run(
+            "UPDATE profiles SET photo_id=NULL WHERE user_id=?",
+            file.owner_id,
+          );
         await cleanFiles();
         return json({ ok: true });
       }
@@ -2392,7 +2588,7 @@ async function handleRequest(req: Request, parts: string[]) {
       await needUser(req, "admin");
       return json({
         donors: await all(
-          "SELECT u.id,u.display_id,p.status FROM users u JOIN profiles p ON p.user_id=u.id",
+          "SELECT u.id,u.display_id,u.email,p.status FROM users u JOIN profiles p ON p.user_id=u.id WHERE u.role='donor' ORDER BY u.created_at DESC",
         ),
       });
     }

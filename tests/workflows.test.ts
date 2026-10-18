@@ -1,4 +1,5 @@
 import { runWorkflow } from "./helpers/workflow-scenario";
+import { runAdminEntry } from "./helpers/admin-entry-scenario";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readdirSync } from "node:fs";
@@ -119,6 +120,10 @@ const signup = (
     "",
     expected,
   );
+
+test("SQLite: reusable free administrator donor entry preserves access controls", async () => {
+  await runAdminEntry(call);
+});
 
 test("決済の額・通貨・申請ID・完了状態をサーバーで照合する", () => {
   const order = {
@@ -266,3 +271,4 @@ test("登録・一括課金・審査・開示と撤回・画像チャット・�
     },
   });
 });
+
